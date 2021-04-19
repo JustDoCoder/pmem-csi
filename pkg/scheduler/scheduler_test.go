@@ -17,11 +17,12 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	admissionv1beta1 "k8s.io/api/admission/v1beta1"
+	admissionv1 "k8s.io/api/admission/v1"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -32,7 +33,7 @@ import (
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	schedulerapi "k8s.io/kube-scheduler/extender/v1"
 	"k8s.io/kubernetes/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -324,6 +325,8 @@ func TestScheduler(t *testing.T) {
 		capacity clusterCapacity
 		// Nodes to check.
 		nodes []string
+		// Whether we pass v1.NodeList (false) or slice of node names (true).
+		nodeCacheCapable bool
 
 		// Results
 		expectedError    string
@@ -342,7 +345,7 @@ func TestScheduler(t *testing.T) {
 			},
 			nodes: []string{nodeA},
 			expectedFailures: map[string]string{
-				nodeA: "checking for capacity: retrieve capacity: node node-A unknown",
+				nodeA: "retrieve capacity: node node-A unknown",
 			},
 		},
 		"one volume, one node, enough capacity": {
@@ -460,6 +463,18 @@ func TestScheduler(t *testing.T) {
 			},
 			expectedNodes: []string{nodeA, nodeB},
 		},
+		"nodeCacheCapable": {
+			pvcs: []*v1.PersistentVolumeClaim{
+				unboundPVC,
+			},
+			nodes: []string{nodeA, nodeB},
+			capacity: clusterCapacity{
+				nodeA: GiG,
+				nodeB: GiG,
+			},
+			nodeCacheCapable: true,
+			expectedNodes:    []string{nodeA, nodeB},
+		},
 		"one volume, two nodes, enough capacity on A": {
 			pvcs: []*v1.PersistentVolumeClaim{
 				unboundPVC,
@@ -514,10 +529,13 @@ func TestScheduler(t *testing.T) {
 		if pod == nil {
 			pod = makePod(scenario.pvcs, scenario.inline)
 		}
-		nodes := makeNodeList(scenario.nodes)
 		args := schedulerapi.ExtenderArgs{
-			Pod:   pod,
-			Nodes: nodes,
+			Pod: pod,
+		}
+		if scenario.nodeCacheCapable {
+			args.NodeNames = &scenario.nodes
+		} else {
+			args.Nodes = makeNodeList(scenario.nodes)
 		}
 		requestBody, err := json.Marshal(args)
 		require.NoError(t, err, "marshal request")
@@ -535,9 +553,16 @@ func TestScheduler(t *testing.T) {
 		require.NoError(t, err, "unmarshal response")
 		assert.Equal(t, scenario.expectedError, result.Error)
 		var names []string
-		if result.Nodes != nil {
-			names = nodeNames(result.Nodes.Items)
+		if scenario.nodeCacheCapable {
+			if result.NodeNames != nil {
+				names = *result.NodeNames
+			}
+		} else {
+			if result.Nodes != nil {
+				names = listNodeNames(result.Nodes.Items)
+			}
 		}
+		sort.Strings(names)
 		assert.Equal(t, scenario.expectedNodes, names)
 		failures := scenario.expectedFailures
 		if failures == nil && scenario.expectedError == "" {
@@ -645,7 +670,7 @@ func TestMutatePod(t *testing.T) {
 		obj, err := json.Marshal(pod)
 		require.NoError(t, err, "encode pod")
 		req := admission.Request{
-			AdmissionRequest: admissionv1beta1.AdmissionRequest{
+			AdmissionRequest: admissionv1.AdmissionRequest{
 				Namespace: "default",
 				Object: runtime.RawExtension{
 					Raw: obj,
@@ -664,6 +689,93 @@ func TestMutatePod(t *testing.T) {
 			// That the patches do indeed add the extended
 			// resource is covered by the E2E test.
 			assert.NotEmpty(t, response.Patches, "JSON patch")
+		}
+	}
+
+	for name, scenario := range scenarios {
+		scenario := scenario
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			run(t, scenario)
+		})
+	}
+}
+
+func TestInputValidation(t *testing.T) {
+	t.Parallel()
+	type scenarioType struct {
+		path           string
+		method         string
+		body           string
+		expectedStatus int
+		expectedResult string
+	}
+	scenarios := map[string]scenarioType{
+		"status ok": {
+			expectedStatus: http.StatusOK,
+		},
+		"invalid path": {
+			path:           "/no-such-path",
+			expectedStatus: http.StatusNotFound,
+		},
+		"invalid method": {
+			method:         http.MethodPatch,
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+		"filter ok": {
+			path:           "/filter",
+			body:           `{"pod": { "metadata":{"name":"test-pod"}}, "nodes": {}}`,
+			expectedStatus: http.StatusOK,
+		},
+		"missing pod": {
+			path:           "/filter",
+			body:           `{"nodes": {}}`,
+			expectedStatus: http.StatusOK,
+			expectedResult: "incomplete parameters",
+		},
+		"missing nodes": {
+			path:           "/filter",
+			body:           `{"pod": { "metadata":{"name":"test-pod"}}}`,
+			expectedStatus: http.StatusOK,
+			expectedResult: "incomplete parameters",
+		},
+	}
+
+	run := func(t *testing.T, scenario scenarioType) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Setup
+		testEnv := newTestEnv(t, clusterCapacity{}, ctx.Done())
+
+		// Prepare request.
+		requestBody := []byte(scenario.body)
+		request := &http.Request{
+			URL:    &url.URL{Path: "/status"},
+			Body:   ioutil.NopCloser(bytes.NewReader(requestBody)),
+			Method: http.MethodGet,
+			Header: http.Header{},
+		}
+		request.Header.Add("Content-Type", "application/json")
+		if scenario.method != "" {
+			request.Method = scenario.method
+		}
+		if scenario.path != "" {
+			request.URL = &url.URL{Path: scenario.path}
+		}
+
+		// Now handle it.
+		r := &response{}
+		testEnv.scheduler.ServeHTTP(r, request)
+
+		// Check response.
+		require.Equal(t, scenario.expectedStatus, r.statusCode)
+		switch scenario.path {
+		case "/filter":
+			var result schedulerapi.ExtenderFilterResult
+			err := json.Unmarshal(r.body, &result)
+			require.NoError(t, err, "unmarshal filter response")
+			assert.Equal(t, scenario.expectedResult, result.Error)
 		}
 	}
 

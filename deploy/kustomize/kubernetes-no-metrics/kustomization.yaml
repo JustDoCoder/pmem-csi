@@ -1,0 +1,18 @@
+bases:
+- ../driver
+- rbac
+
+resources:
+- driverinfo-beta.yaml
+
+# The RBAC files must match the image versions.
+# The sidecar versions must be kept in sync with the
+# operator defaults in pkg/apis/pmemcsi/v1alpha1/deployment_types.go!
+images:
+- name: k8s.gcr.io/sig-storage/csi-provisioner
+  newTag: v2.1.1
+- name: k8s.gcr.io/sig-storage/csi-node-driver-registrar
+  newTag: v1.2.0
+
+# Keep all the driver objects in 'pmem-csi' namespace
+namespace: pmem-csi

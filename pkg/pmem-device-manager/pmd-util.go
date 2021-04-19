@@ -6,9 +6,10 @@ import (
 	"strconv"
 	"time"
 
-	pmemexec "github.com/intel/pmem-csi/pkg/pmem-exec"
+	pmemerr "github.com/intel/pmem-csi/pkg/errors"
+	pmemexec "github.com/intel/pmem-csi/pkg/exec"
 	"golang.org/x/sys/unix"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -44,13 +45,16 @@ func clearDevice(dev *PmemDeviceInfo, flush bool) error {
 	defer unix.Close(fd)
 
 	if err != nil {
-		return fmt.Errorf("failed to clear device %q: %w", dev.Path, ErrDeviceInUse)
+		return fmt.Errorf("failed to clear device %q: %w", dev.Path, pmemerr.DeviceInUse)
 	}
 
 	if blocks == 0 {
 		klog.V(5).Infof("Wiping entire device: %s", dev.Path)
-		// use one iteration instead of shred's default=3 for speed
-		if _, err := pmemexec.RunCommand("shred", "-n", "1", dev.Path); err != nil {
+		// shred would write n times using random data, followed by optional write of zeroes.
+		// For faster operation, and because we consider zeroing enough for
+		// reasonable clearing in case of a memory device, we force zero iterations
+		// with random data, followed by one pass writing zeroes.
+		if _, err := pmemexec.RunCommand("shred", "-n", "0", "-z", dev.Path); err != nil {
 			return fmt.Errorf("device shred failure: %v", err.Error())
 		}
 	} else {
@@ -78,5 +82,5 @@ func waitDeviceAppears(dev *PmemDeviceInfo) error {
 			i, dev.Path, retryStatTimeout)
 		time.Sleep(retryStatTimeout)
 	}
-	return fmt.Errorf("%s: %w", dev.Path, ErrDeviceNotReady)
+	return fmt.Errorf("%s: device not ready", dev.Path)
 }

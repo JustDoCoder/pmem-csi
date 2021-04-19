@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -20,14 +19,16 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/keymutex"
 	"k8s.io/utils/mount"
 
+	pmemerr "github.com/intel/pmem-csi/pkg/errors"
+	pmemexec "github.com/intel/pmem-csi/pkg/exec"
 	grpcserver "github.com/intel/pmem-csi/pkg/grpc-server"
 	"github.com/intel/pmem-csi/pkg/imagefile"
 	"github.com/intel/pmem-csi/pkg/pmem-csi-driver/parameters"
 	pmdmanager "github.com/intel/pmem-csi/pkg/pmem-device-manager"
-	pmemexec "github.com/intel/pmem-csi/pkg/pmem-exec"
 	"github.com/intel/pmem-csi/pkg/volumepathhandler"
 )
 
@@ -57,14 +58,14 @@ type nodeServer struct {
 	cs       *nodeControllerServer
 	// Driver deployed to provision only ephemeral volumes(only for Kubernetes v1.15)
 	mounter mount.Interface
-	volInfo map[string]volumeInfo
 
 	// A directory for additional mount points.
 	mountDirectory string
 }
 
 var _ csi.NodeServer = &nodeServer{}
-var _ grpcserver.PmemService = &nodeServer{}
+var _ grpcserver.Service = &nodeServer{}
+var volumeMutex = keymutex.NewHashed(-1)
 
 func NewNodeServer(cs *nodeControllerServer, mountDirectory string) *nodeServer {
 	return &nodeServer{
@@ -79,7 +80,6 @@ func NewNodeServer(cs *nodeControllerServer, mountDirectory string) *nodeServer 
 		},
 		cs:             cs,
 		mounter:        mount.New(""),
-		volInfo:        map[string]volumeInfo{},
 		mountDirectory: mountDirectory,
 	}
 }
@@ -93,7 +93,7 @@ func (ns *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReque
 		NodeId: ns.cs.nodeID,
 		AccessibleTopology: &csi.Topology{
 			Segments: map[string]string{
-				PmemDriverTopologyKey: ns.cs.nodeID,
+				DriverTopologyKey: ns.cs.nodeID,
 			},
 		},
 	}, nil
@@ -153,7 +153,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		// 1) No Volume found with given volume id
 		// 2) No provisioner info found in VolumeContext "storage.kubernetes.io/csiProvisionerIdentity"
 		// 3) No StagingPath in the request
-		if device, err = ns.cs.dm.GetDevice(req.VolumeId); err != nil && !errors.Is(err, pmdmanager.ErrDeviceNotFound) {
+		if device, err = ns.cs.dm.GetDevice(req.VolumeId); err != nil && !errors.Is(err, pmemerr.DeviceNotFound) {
 			return nil, status.Errorf(codes.Internal, "failed to get device details for volume id '%s': %v", req.VolumeId, err)
 		}
 		_, ok := req.GetVolumeContext()[volumeProvisionerIdentity]
@@ -183,8 +183,13 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		}
 		volumeParameters = v
 
-		if device, err = ns.cs.dm.GetDevice(req.VolumeId); err != nil {
-			if errors.Is(err, pmdmanager.ErrDeviceNotFound) {
+		dm, err := ns.getDeviceManagerForVolume(req.VolumeId)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+
+		if device, err = dm.GetDevice(req.VolumeId); err != nil {
+			if errors.Is(err, pmemerr.DeviceNotFound) {
 				return nil, status.Errorf(codes.NotFound, "no device found with volume id %q: %v", req.VolumeId, err)
 			}
 			return nil, status.Errorf(codes.Internal, "failed to get device details for volume id %q: %v", req.VolumeId, err)
@@ -195,11 +200,6 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if readOnly {
 		mountFlags = append(mountFlags, "ro")
 	}
-
-	// After mountFlags additions are complete: sort mountFlags slice and join to
-	// become a single string, as this is what we use to compare against existing
-	sort.Strings(mountFlags)
-	joinedMountFlags := strings.Join(mountFlags[:], ",")
 
 	rawBlock := false
 	switch req.VolumeCapability.GetAccessType().(type) {
@@ -224,22 +224,22 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			//    VolumeCapability/fsType (if present in request) must match used fsType.
 			// 3) Readonly MUST match
 			// If there is mismatch of any of above, we return ALREADY_EXISTS error.
-			existingFsType, err := determineFilesystemType(device.Path)
+			mpList, err := ns.mounter.List()
 			if err != nil {
-				return nil, err
+				return nil, status.Errorf(codes.Internal, "Failed to fetch existing mount details while checking %q: %v", targetPath, err)
 			}
-			klog.V(5).Infof("NodePublishVolume[%s]: existing: RO:%v TargetPath:%v, mountFlags:[%s] fsType:%s",
-				req.VolumeId, ns.volInfo[req.VolumeId].readOnly, ns.volInfo[req.VolumeId].targetPath, ns.volInfo[req.VolumeId].mountFlags, existingFsType)
-			if readOnly == ns.volInfo[req.VolumeId].readOnly &&
-				targetPath == ns.volInfo[req.VolumeId].targetPath &&
-				ns.volInfo[req.VolumeId].mountFlags == joinedMountFlags &&
-				(fsType == "" || fsType == existingFsType) {
-				klog.V(5).Infof("NodePublishVolume[%s]: paremeters match existing, return OK", req.VolumeId)
-				return &csi.NodePublishVolumeResponse{}, nil
-			} else {
-				klog.V(5).Infof("NodePublishVolume[%s]: paremeters do not match existing, return ALREADY_EXISTS", req.VolumeId)
-				return nil, status.Error(codes.AlreadyExists, "Volume published but is incompatible")
+			for i := len(mpList) - 1; i >= 0; i-- {
+				if mpList[i].Path == targetPath {
+					klog.V(5).Infof("NodePublishVolume[%s]: Existing mountFlags:'%s', fsTyp: '%s'", req.VolumeId, mpList[i].Opts, mpList[i].Type)
+					if (fsType == "" || mpList[i].Type == fsType) && findMountFlags(mountFlags, mpList[i].Opts) {
+						klog.V(5).Infof("NodePublishVolume[%s]: parameters match existing, return OK", req.VolumeId)
+						return &csi.NodePublishVolumeResponse{}, nil
+					}
+					break
+				}
 			}
+			klog.V(5).Infof("NodePublishVolume[%s]: parameters do not match existing volume, return ALREADY_EXISTS", req.VolumeId)
+			return nil, status.Error(codes.AlreadyExists, "Volume published but is incompatible")
 		}
 	}
 
@@ -272,7 +272,6 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 	if !volumeParameters.GetKataContainers() {
 		// A normal volume, return early.
-		ns.volInfo[req.VolumeId] = volumeInfo{readOnly: readOnly, targetPath: targetPath, mountFlags: joinedMountFlags}
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
@@ -333,7 +332,6 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	ns.volInfo[req.VolumeId] = volumeInfo{readOnly: readOnly, targetPath: targetPath, mountFlags: joinedMountFlags}
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -429,7 +427,6 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 			return nil, status.Error(codes.Internal, fmt.Sprintf("Failed to delete ephemeral volume %s: %s", req.VolumeId, err.Error()))
 		}
 	}
-	delete(ns.volInfo, req.VolumeId)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
@@ -496,9 +493,14 @@ func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	klog.V(4).Infof("NodeStageVolume: VolumeID:%v Staging target path:%v Requested fsType:%v Requested mount options:%v",
 		req.GetVolumeId(), stagingtargetPath, requestedFsType, mountOptions)
 
-	device, err := ns.cs.dm.GetDevice(req.VolumeId)
+	dm, err := ns.getDeviceManagerForVolume(req.VolumeId)
 	if err != nil {
-		if errors.Is(err, pmdmanager.ErrDeviceNotFound) {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+
+	device, err := dm.GetDevice(req.VolumeId)
+	if err != nil {
+		if errors.Is(err, pmemerr.DeviceNotFound) {
 			return nil, status.Errorf(codes.NotFound, "no device found with volume id %q: %v", req.VolumeId, err)
 		}
 		return nil, status.Errorf(codes.Internal, "failed to get device details for volume id %q: %v", req.VolumeId, err)
@@ -551,11 +553,15 @@ func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	klog.V(4).Infof("NodeUnStageVolume: VolumeID:%v Staging target path:%v",
 		req.GetVolumeId(), stagingtargetPath)
 
+	dm, err := ns.getDeviceManagerForVolume(req.VolumeId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
 	// by spec, we have to return OK if asked volume is not mounted on asked path,
 	// so we look up the current device by volumeID and see is that device
 	// mounted on staging target path
-	if _, err := ns.cs.dm.GetDevice(req.VolumeId); err != nil {
-		if errors.Is(err, pmdmanager.ErrDeviceNotFound) {
+	if _, err := dm.GetDevice(req.VolumeId); err != nil {
+		if errors.Is(err, pmemerr.DeviceNotFound) {
 			return nil, status.Errorf(codes.NotFound, "no device found with volume id '%s': %s", req.VolumeId, err.Error())
 		}
 		return nil, status.Errorf(codes.Internal, "failed to get device details for volume id '%s': %s", req.VolumeId, err.Error())
@@ -610,7 +616,7 @@ func (ns *nodeServer) createEphemeralDevice(ctx context.Context, req *csi.NodePu
 
 	// Create filesystem
 	if err := ns.provisionDevice(device, req.GetVolumeCapability().GetMount().GetFsType()); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("ephmeral inline volume: failed to create filesystem: %v", err))
+		return nil, status.Error(codes.Internal, fmt.Sprintf("ephemeral inline volume: failed to create filesystem: %v", err))
 	}
 
 	return device, nil
@@ -666,7 +672,7 @@ func (ns *nodeServer) mount(sourcePath, targetPath string, mountOptions []string
 
 	// Create target path, using a file for raw block bind mounts
 	// or a directory for filesystems. Might already exist from a
-	// previous call or because Kubernetes erronously created it
+	// previous call or because Kubernetes erroneously created it
 	// for us.
 	if rawBlock {
 		f, err := os.OpenFile(targetPath, os.O_CREATE, os.FileMode(0644))
@@ -697,6 +703,31 @@ func (ns *nodeServer) mount(sourcePath, targetPath string, mountOptions []string
 	return nil
 }
 
+// getDeviceManagerForVolume checks the stored volume parametes for the
+// given id and returns the device manager which creates that volume.
+func (ns *nodeServer) getDeviceManagerForVolume(id string) (pmdmanager.PmemDeviceManager, error) {
+
+	vol := ns.cs.getVolumeByID(id)
+	if vol == nil {
+		return nil, fmt.Errorf("unknown volume: %s", id)
+	}
+
+	v, err := parameters.Parse(parameters.NodeVolumeOrigin, vol.Params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse volume parameters for volume %q: %v", id, err)
+	}
+
+	dm := ns.cs.dm
+	if v.GetDeviceMode() != dm.GetMode() {
+		dm, err = pmdmanager.New(v.GetDeviceMode(), 0)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize device manager for volume '%s'(volume mode: '%s'): %v", id, v.GetDeviceMode(), err)
+		}
+	}
+
+	return dm, nil
+}
+
 // This is based on function used in LV-CSI driver
 func determineFilesystemType(devicePath string) (string, error) {
 	if devicePath == "" {
@@ -725,7 +756,7 @@ func determineFilesystemType(devicePath string) (string, error) {
 		return "", fmt.Errorf("no device information for %s", devicePath)
 	}
 
-	// exptected output format from blkid:
+	// expected output format from blkid:
 	// devicepath: UUID="<uuid>" TYPE="<filesystem type>"
 	attrs := strings.Split(string(output), ":")
 	if len(attrs) != 2 {
@@ -755,4 +786,28 @@ func ensureDirectory(mounter mount.Interface, dir string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// findMountFlags finds existence of all flags in findIn array
+func findMountFlags(flags []string, findIn []string) bool {
+	for _, f := range flags {
+		// bind mounts are not visible in mount options
+		// so ignore the flag
+		if f == "bind" {
+			continue
+		}
+		found := false
+		for _, fIn := range findIn {
+			if f == fIn {
+				found = true
+				break
+			}
+		}
+		if !found {
+			klog.V(5).Infof("Mount flag '%s' not found in %v", f, findIn)
+			return false
+		}
+	}
+
+	return true
 }

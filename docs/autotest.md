@@ -42,14 +42,6 @@ volumes are not passed in as PMEM, but Kata Containers [can be
 installed](https://github.com/kata-containers/packaging/tree/master/kata-deploy#kubernetes-quick-start)
 and used for applications that are not using PMEM.
 
-The `clear-cloud` image is downloaded automatically. By default,
-four different virtual machines are prepared. Each image is pre-configured
-with its own hostname and with network.
-
-The images will contain the latest
-[Clear Linux OS](https://clearlinux.org/) and have the Kubernetes
-version supported by Clear Linux installed.
-
 PMEM-CSI images must have been created and published in some Docker
 registry, as described earlier in [build PMEM-CSI](DEVELOPMENT.md#build-pmem-csi).
 In addition, that registry must be accessible from inside the
@@ -64,8 +56,11 @@ virtual machines.
 The first node is the Kubernetes master without
 persistent memory.
 The other three nodes are worker nodes with one emulated 32GB NVDIMM each.
-After the cluster has been formed, `make start` adds `storage=pmem` label
-to the worker nodes and deploys the PMEM-CSI driver.
+After the cluster has been formed, `make start` installs [NFD](https://kubernetes-sigs.github.io/node-feature-discovery/stable/get-started/index.html) to label
+the worker nodes. The PMEM-CSI driver can be installed with
+`test/setup-deployment.sh`, but will also be installed as needed by
+the E2E test suite.
+
 Once `make start` completes, the cluster is ready for interactive use via
 `kubectl` inside the virtual machine. Alternatively, you can also
 set `KUBECONFIG` as shown at the end of the `make start` output
@@ -75,7 +70,10 @@ Use `make stop` to stop and remove the virtual machines.
 
 `make restart` can be used to cleanly reboot all virtual
 machines. This is useful during development after a `make push-images`
-to ensure that the cluster runs those rebuilt images.
+to ensure that the cluster runs those rebuilt images. However, for
+that to work the image pull policy has to be changed from the default
+"if not present" to "always" by setting the `TEST_IMAGE_PULL_POLICY`
+environment variable to `Always`.
 
 ## Running commands on test cluster nodes over ssh
 
@@ -106,11 +104,11 @@ permanently by creating a file like `test/test-config.d/my-config.sh`.
 Multiple different clusters can be brought up in parallel by changing
 the default `pmem-govm` cluster name via the `CLUSTER` env variable.
 
-For example, this invocation sets up a cluster using the non-default
-Fedora distro:
+For example, this invocation sets up a cluster using an older release
+of Kubernetes:
 
-``` sh
-TEST_DISTRO=fedora CLUSTER=fedora-govm make start
+``` 
+TEST_KUBERNETES_VERSION=1.18 CLUSTER=kubernetes-1.18 make start
 ```
 
 See additional details in [test/test-config.d](/test/test-config.d).
@@ -128,7 +126,7 @@ can be used to run individual tests and to control additional aspects
 of the test run. For example, to run just the E2E provisioning test
 (create PVC, write data in one pod, read it in another) in verbose mode:
 
-``` sh
+``` console
 $ KUBECONFIG=$(pwd)/_work/pmem-govm/kube.config REPO_ROOT=$(pwd) ginkgo -v -focus=pmem-csi.*should.provision.storage.with.defaults ./test/e2e/
 Nov 26 11:21:28.805: INFO: The --provider flag is not set.  Treating as a conformance test.  Some tests may not be run.
 Running Suite: PMEM E2E suite
@@ -150,7 +148,7 @@ Test Suite Passed
 
 It is also possible to run just the sanity tests until one of them fails:
 
-``` sh
+``` console
 $ REPO_ROOT=`pwd` ginkgo '-focus=sanity' -failFast ./test/e2e/
 ...
 ```

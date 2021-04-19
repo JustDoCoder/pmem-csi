@@ -9,10 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 package validate
 
 import (
-	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -21,11 +18,15 @@ import (
 	"strings"
 	"time"
 
-	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1alpha1"
+	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
 	"github.com/intel/pmem-csi/pkg/deployments"
+	operatordeployment "github.com/intel/pmem-csi/pkg/pmem-csi-operator/controller/deployment"
 	"github.com/intel/pmem-csi/pkg/version"
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
 
 	"gopkg.in/yaml.v2"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,7 +36,7 @@ import (
 // objects for a certain deployment spec. deploymentSpec should only have those fields
 // set which are not the defaults. This call will wait for the expected objects until
 // the context times out.
-func DriverDeploymentEventually(ctx context.Context, client client.Client, k8sver version.Version, namespace string, deployment api.Deployment) error {
+func DriverDeploymentEventually(ctx context.Context, client client.Client, k8sver version.Version, namespace string, deployment api.PmemCSIDeployment, initialCreation bool) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -43,37 +44,71 @@ func DriverDeploymentEventually(ctx context.Context, client client.Client, k8sve
 		return errors.New("deployment not an object that was stored in the API server, no UID")
 	}
 
+	// Track resource versions to detect modifications?
+	var resourceVersions map[string]string
+	if initialCreation {
+		resourceVersions = map[string]string{}
+	}
+
 	// TODO: once there is a better way to detect that the
 	// operator has finished updating the deployment, check for
 	// that here instead of repeatedly checking the objects.
 	// As it stands now, permanent differences will only be
 	// reported when the test times out.
-	ready := func() (err error) {
-		return DriverDeployment(client, k8sver, namespace, deployment)
+	ready := func() (final bool, err error) {
+		return DriverDeployment(ctx, client, k8sver, namespace, deployment, resourceVersions)
 	}
-	if err := ready(); err != nil {
+	if final, err := ready(); err != nil {
+		if final {
+			return err
+		}
+	loop:
 		for {
 			select {
 			case <-ticker.C:
-				err = ready()
+				final, err = ready()
 				if err == nil {
-					return nil
+					break loop
+				}
+				if final {
+					return err
 				}
 			case <-ctx.Done():
 				return fmt.Errorf("timed out waiting for deployment, last error: %v", err)
 			}
 		}
 	}
-	return nil
+
+	// Now wait a bit longer to see whether the objects change again - they shouldn't.
+	// The longer we wait, the more certainty we have that we have reached a stable state.
+	deadline, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		select {
+		case <-ticker.C:
+			if _, err := ready(); err != nil {
+				return fmt.Errorf("objects were changed after reaching expected state: %v", err)
+			}
+		case <-deadline.Done():
+			return nil
+		}
+	}
 }
 
 // DriverDeployment compares all objects as deployed by the operator against the expected
 // objects for a certain deployment spec. deploymentSpec should only have those fields
 // set which are not the defaults. The caller must ensure that the operator is done
 // with creating objects.
-func DriverDeployment(client client.Client, k8sver version.Version, namespace string, deployment api.Deployment) error {
+//
+// resourceVersions is used to track which resource versions were encountered
+// for generated objects. If not nil, the version must not change (i.e. the operator
+// must not update the objects after creating them).
+//
+// A final error is returned when observing a problem that is not going to go away,
+// like an unexpected update of an object.
+func DriverDeployment(ctx context.Context, c client.Client, k8sver version.Version, namespace string, deployment api.PmemCSIDeployment, resourceVersions map[string]string) (final bool, finalErr error) {
 	if deployment.GetUID() == "" {
-		return errors.New("deployment not an object that was stored in the API server, no UID")
+		return true, errors.New("deployment not an object that was stored in the API server, no UID")
 	}
 
 	// The operator currently always uses the production image. We
@@ -82,39 +117,60 @@ func DriverDeployment(client client.Client, k8sver version.Version, namespace st
 	(&deployment).EnsureDefaults(driverImage)
 
 	// Validate sub-objects. A sub-object is anything that has the deployment object as owner.
-	objects, err := listAllDeployedObjects(client, deployment)
+	objects, err := listAllDeployedObjects(ctx, c, deployment, namespace)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	expectedObjects, err := deployments.LoadAndCustomizeObjects(k8sver, deployment.Spec.DeviceMode, deployment.Name, namespace, deployment)
+	// Load secret if it exists. If it doesn't, we validate without it.
+	var controllerCABundle []byte
+	if deployment.Spec.ControllerTLSSecret != "" {
+		secret := &corev1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "Secret",
+			},
+		}
+		objKey := client.ObjectKey{
+			Namespace: namespace,
+			Name:      deployment.Spec.ControllerTLSSecret,
+		}
+		if err := c.Get(ctx, objKey, secret); err != nil {
+			if !apierrs.IsNotFound(err) {
+				return false, err
+			}
+		} else {
+			if ca, ok := secret.Data[api.TLSSecretCA]; ok {
+				controllerCABundle = ca
+			}
+		}
+	}
+
+	expectedObjects, err := deployments.LoadAndCustomizeObjects(k8sver, deployment.Spec.DeviceMode, namespace, deployment, controllerCABundle)
 	if err != nil {
-		return fmt.Errorf("customize expected objects: %v", err)
+		return true, fmt.Errorf("customize expected objects: %v", err)
 	}
 
 	var diffs []string
 	for _, actual := range objects {
+		// When the CR just got created, the operator should
+		// immediately create objects with the right content and then
+		// not update them again.
+		if resourceVersions != nil {
+			uid := string(actual.GetUID())
+			currentResourceVersion := actual.GetResourceVersion()
+			oldResourceVersion, ok := resourceVersions[uid]
+			if ok {
+				if oldResourceVersion != currentResourceVersion {
+					diffs = append(diffs, fmt.Sprintf("object was modified unnecessarily: %s", prettyPrintObjectID(actual)))
+					final = true
+				}
+			} else {
+				resourceVersions[uid] = currentResourceVersion
+			}
+		}
 		expected := findObject(expectedObjects, actual)
 		if expected == nil {
-			if actual.GetKind() == "Secret" {
-				// Custom comparison against expected
-				// content of secrets, which aren't
-				// part of the reference objects.
-				switch actual.GetName() {
-				case deployment.Name + "-registry-secrets":
-					diffs = append(diffs, compareSecrets(actual,
-						deployment.Spec.CACert,
-						deployment.Spec.RegistryPrivateKey,
-						deployment.Spec.RegistryCert)...)
-					continue
-				case deployment.Name + "-node-secrets":
-					diffs = append(diffs, compareSecrets(actual,
-						deployment.Spec.CACert,
-						deployment.Spec.NodeControllerPrivateKey,
-						deployment.Spec.NodeControllerCert)...)
-					continue
-				}
-			}
 			diffs = append(diffs, fmt.Sprintf("unexpected object was deployed: %s", prettyPrintObjectID(actual)))
 			continue
 		}
@@ -142,31 +198,37 @@ func DriverDeployment(client client.Client, k8sver version.Version, namespace st
 			}
 		}
 
-		// The spec needs to be identical.
-		expectedSpec := expected.Object["spec"]
-		actualSpec := actual.Object["spec"]
-		specDiff := compareSpec(expected.GetKind(), expectedSpec, actualSpec)
-		if specDiff != nil {
-			diffs = append(diffs, fmt.Sprintf("spec content for %s does not match:\n   %s", prettyPrintObjectID(*expected), strings.Join(specDiff, "\n   ")))
+		// Certain top-level fields must be identical.
+		fields := map[string]bool{}
+		for field := range expected.Object {
+			fields[field] = true
+		}
+		for field := range actual.Object {
+			fields[field] = true
+		}
+		for field := range fields {
+			switch field {
+			case "metadata", "status":
+				// Verified above or may vary.
+				continue
+			}
+			expectedField := expected.Object[field]
+			actualField := actual.Object[field]
+			diff := compare(expected.GetKind(), field, expectedField, actualField)
+			if diff != nil {
+				diffs = append(diffs, fmt.Sprintf("%s content for %s does not match:\n   %s", field, prettyPrintObjectID(*expected), strings.Join(diff, "\n   ")))
+			}
 		}
 	}
-	gvk := schema.GroupVersionKind{
-		Kind:    "Secret",
-		Version: "v1",
-	}
-	for _, expected := range append(expectedObjects,
-		// Content doesn't matter, we just want to be sure they exist.
-		createObject(gvk, deployment.Name+"-registry-secrets", namespace),
-		createObject(gvk, deployment.Name+"-node-secrets", namespace)) {
+	for _, expected := range expectedObjects {
 		if findObject(objects, expected) == nil {
 			diffs = append(diffs, fmt.Sprintf("expected object was not deployed: %v", prettyPrintObjectID(expected)))
 		}
 	}
 	if diffs != nil {
-		return fmt.Errorf("deployed driver different from expected deployment:\n%s", strings.Join(diffs, "\n"))
+		finalErr = fmt.Errorf("deployed driver different from expected deployment:\n%s", strings.Join(diffs, "\n"))
 	}
-
-	return nil
+	return
 }
 
 func createObject(gvk schema.GroupVersionKind, name, namespace string) unstructured.Unstructured {
@@ -178,45 +240,6 @@ func createObject(gvk schema.GroupVersionKind, name, namespace string) unstructu
 	return obj
 }
 
-func compareSecrets(actual unstructured.Unstructured, ca, key, crt []byte) (diffs []string) {
-	data := actual.Object["data"]
-	if data == nil {
-		return []string{fmt.Sprintf("%s: no data in secret", actual.GetName())}
-	}
-	fields := data.(map[string]interface{})
-	diffs = append(diffs, compareSecretField(actual.GetName(), fields, "ca.crt", ca)...)
-	diffs = append(diffs, compareSecretField(actual.GetName(), fields, "tls.key", key)...)
-	diffs = append(diffs, compareSecretField(actual.GetName(), fields, "tls.crt", crt)...)
-	return
-}
-
-func compareSecretField(name string, fields map[string]interface{}, fieldName string, expectedData []byte) []string {
-	field := fields[fieldName]
-	if field == nil {
-		return []string{fmt.Sprintf("secret %s does not contain data field %s", name, fieldName)}
-	}
-	actualData, err := base64.StdEncoding.DecodeString(field.(string))
-	if err != nil {
-		return []string{fmt.Sprintf("decoding secret %s field %s: %v", name, fieldName, err)}
-	}
-	if expectedData == nil {
-		// We only know that there should be some data, but not what it should be.
-		if len(actualData) == 0 {
-			return []string{fmt.Sprintf("secret %s contains empty data field %s", name, fieldName)}
-		}
-	} else {
-		if bytes.Compare(actualData, expectedData) != 0 {
-			return []string{fmt.Sprintf("secret %s, field %s: data mismatch: got %s, expected %s",
-				name, fieldName, summarizeData(actualData), summarizeData(expectedData))}
-		}
-	}
-	return nil
-}
-
-func summarizeData(data []byte) string {
-	return fmt.Sprintf("len %d, hash %x", len(data), md5.Sum(data))
-}
-
 // When we get an object back from the apiserver, some fields get populated with generated
 // or fixed default values. defaultSpecValues contains a hierarchy of maps that stores those
 // defaults:
@@ -224,53 +247,77 @@ func summarizeData(data []byte) string {
 //
 // Those defaults are used when the original object didn't have a field value.
 // "ignore" is a special value which let's the comparison skip the field.
-var defaultSpecValues = parseDefaultSpecValues()
+var defaultValues = parseDefaultValues()
 
-func parseDefaultSpecValues() map[string]interface{} {
+func parseDefaultValues() map[string]interface{} {
 	var defaults map[string]interface{}
 	defaultsApps := `
-  revisionHistoryLimit: 10
-  podManagementPolicy: OrderedReady
-  selector:
-    matchLabels:
-      pmem-csi.intel.com/deployment: ignore # labels are tested separately
-  template:
-    metadata:
-      labels:
+  spec:
+    revisionHistoryLimit: 10
+    podManagementPolicy: OrderedReady
+    selector:
+      matchLabels:
         pmem-csi.intel.com/deployment: ignore # labels are tested separately
-    spec:
-      dnsPolicy: ClusterFirst
-      restartPolicy: Always
-      serviceAccount: ignore # redundant field, always returned by apiserver in addition to serviceAccountName
-      schedulerName: default-scheduler
-      terminationGracePeriodSeconds: 30
-      containers:
-        terminationMessagePath: /dev/termination-log
-        terminationMessagePolicy: File
-        imagePullPolicy: IfNotPresent
-      initContainers:
-        terminationMessagePath: /dev/termination-log
-        terminationMessagePolicy: File
-        imagePullPolicy: IfNotPresent
-      volumes:
-        secret:
-          defaultMode: 420`
+    template:
+      metadata:
+        labels:
+          pmem-csi.intel.com/deployment: ignore # labels are tested separately
+      spec:
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        serviceAccount: ignore # redundant field, always returned by apiserver in addition to serviceAccountName
+        schedulerName: default-scheduler
+        terminationGracePeriodSeconds: 30
+        containers:
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          imagePullPolicy: IfNotPresent
+          ports:
+            protocol: TCP
+          env:
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+        volumes:
+          secret:
+            defaultMode: 420`
 
 	defaultsYAML := `
 Service:
-  clusterIP: ignore
-  externalTrafficPolicy: Cluster
-  ports:
-    protocol: TCP
-    nodePort: ignore
-  selector:
-    pmem-csi.intel.com/deployment: ignore # labels are tested separately
-  sessionAffinity: None
-  type: ClusterIP
+  spec:
+    clusterIP: ignore
+    clusterIPs: ignore # since k8s v1.20
+    externalTrafficPolicy: Cluster
+    ports:
+      protocol: TCP
+      nodePort: ignore
+    selector:
+      pmem-csi.intel.com/deployment: ignore # labels are tested separately
+    sessionAffinity: None
+    type: ClusterIP
+ServiceAccount:
+  secrets: ignore
 DaemonSet:` + defaultsApps + `
-  updateStrategy: ignore
+    updateStrategy: ignore
 StatefulSet:` + defaultsApps + `
-  updateStrategy: ignore
+    updateStrategy: ignore
+CSIDriver:
+  spec:
+    storageCapacity: false
+    fsGroupPolicy: ignore # currently PMEM-CSI driver does not support fsGroupPolicy
+MutatingWebhookConfiguration:
+  webhooks:
+    clientConfig:
+      service:
+        port: 443
+    admissionReviewVersions:
+    - v1beta1
+    matchPolicy: Equivalent # default policy in v1
+    reinvocationPolicy: Never
+    rules:
+      scope: "*"
+    sideEffects: Unknown
+    timeoutSeconds: 10 # default timeout in v1
 `
 
 	err := yaml.UnmarshalStrict([]byte(defaultsYAML), &defaults)
@@ -280,16 +327,18 @@ StatefulSet:` + defaultsApps + `
 	return defaults
 }
 
-// compareSpec is like reflect.DeepEqual, except that it reports back all changes
+// compare is like reflect.DeepEqual, except that it reports back all changes
 // in a diff-like format, with one entry per added, removed or different field.
 // In addition, it fills in default values in the expected spec if they are missing
 // before comparing against the actual value. This makes it possible to
 // compare the on-disk YAML files which are typically not complete against
-// objects frome the apiserver which have all defaults filled in.
-func compareSpec(kind string, expected, actual interface{}) []string {
-	defaults := defaultSpecValues[kind]
-	path := "spec"
-	return compareSpecRecursive(path, defaults, expected, actual)
+// objects from the apiserver which have all defaults filled in.
+func compare(kind string, field string, expected, actual interface{}) []string {
+	defaults := defaultValues[kind]
+	if defaultsMap, ok := defaults.(map[interface{}]interface{}); ok {
+		defaults = defaultsMap[field]
+	}
+	return compareSpecRecursive(field, defaults, expected, actual)
 }
 
 func compareSpecRecursive(path string, defaults, expected, actual interface{}) (diffs []string) {
@@ -350,14 +399,14 @@ func compareSpecRecursive(path string, defaults, expected, actual interface{}) (
 		// Gather and sort all keys before iterating over them to make
 		// the result deterministic.
 		keys := map[string]bool{}
-		for key, _ := range actualMap {
+		for key := range actualMap {
 			keys[key] = true
 		}
-		for key, _ := range expectedMap {
+		for key := range expectedMap {
 			keys[key] = true
 		}
 		var sortedKeys []string
-		for key, _ := range keys {
+		for key := range keys {
 			sortedKeys = append(sortedKeys, key)
 		}
 		sort.Strings(sortedKeys)
@@ -424,36 +473,23 @@ func prettyPrintObjectID(object unstructured.Unstructured) string {
 		object.GetNamespace())
 }
 
-// A list of all object types potentially created by the
-// operator. It's okay and desirable to list more than actually used
-// at the moment, to catch new objects.
-var allObjectTypes = []schema.GroupVersionKind{
-	schema.GroupVersionKind{"", "v1", "SecretList"},
-	schema.GroupVersionKind{"", "v1", "ServiceList"},
-	schema.GroupVersionKind{"", "v1", "ServiceAccountList"},
-	schema.GroupVersionKind{"admissionregistration.k8s.io", "v1beta1", "MutatingWebhookConfigurationList"},
-	schema.GroupVersionKind{"apps", "v1", "DaemonSetList"},
-	schema.GroupVersionKind{"apps", "v1", "DeploymentList"},
-	schema.GroupVersionKind{"apps", "v1", "ReplicaSetList"},
-	schema.GroupVersionKind{"apps", "v1", "StatefulSetList"},
-	schema.GroupVersionKind{"rbac.authorization.k8s.io", "v1", "ClusterRoleList"},
-	schema.GroupVersionKind{"rbac.authorization.k8s.io", "v1", "ClusterRoleBindingList"},
-	schema.GroupVersionKind{"rbac.authorization.k8s.io", "v1", "RoleList"},
-	schema.GroupVersionKind{"rbac.authorization.k8s.io", "v1", "RoleBindingList"},
-	schema.GroupVersionKind{"storage.k8s.io", "v1beta1", "CSIDriverList"},
-}
-
-func listAllDeployedObjects(client client.Client, deployment api.Deployment) ([]unstructured.Unstructured, error) {
+func listAllDeployedObjects(ctx context.Context, c client.Client, deployment api.PmemCSIDeployment, namespace string) ([]unstructured.Unstructured, error) {
 	objects := []unstructured.Unstructured{}
 
-	for _, gvk := range allObjectTypes {
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(gvk)
+	for _, list := range operatordeployment.AllObjectLists() {
+		opts := &client.ListOptions{
+			Namespace: namespace,
+		}
+		// Test client does not support differentiating cluster-scoped objects
+		// and the query fails when fetch those object by setting the namespace-
+		switch list.GetKind() {
+		case "CSIDriverList", "ClusterRoleList", "ClusterRoleBindingList", "MutatingWebhookConfigurationList":
+			opts = &client.ListOptions{}
+		}
 		// Filtering by owner doesn't work, so we have to use brute-force and look at all
 		// objects.
-		// TODO (?): filter at least by namespace, where applicable.
-		if err := client.List(context.Background(), list); err != nil {
-			return objects, fmt.Errorf("list %s: %v", gvk, err)
+		if err := c.List(ctx, list, opts); err != nil {
+			return objects, fmt.Errorf("list %s: %v", list.GetObjectKind(), err)
 		}
 	outer:
 		for _, object := range list.Items {

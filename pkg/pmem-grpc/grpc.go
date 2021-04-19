@@ -11,11 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kubernetes-csi/csi-lib-utils/connection"
+	"github.com/kubernetes-csi/csi-lib-utils/metrics"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	pmemcommon "github.com/intel/pmem-csi/pkg/pmem-common"
 )
@@ -53,7 +55,7 @@ func Connect(endpoint string, tlsConfig *tls.Config, dialOptions ...grpc.DialOpt
 }
 
 //NewServer is a helper function to start a grpc server at given endpoint and uses provided tlsConfig
-func NewServer(endpoint string, tlsConfig *tls.Config, opts ...grpc.ServerOption) (*grpc.Server, net.Listener, error) {
+func NewServer(endpoint string, tlsConfig *tls.Config, csiMetricsManager metrics.CSIMetricsManager, opts ...grpc.ServerOption) (*grpc.Server, net.Listener, error) {
 	proto, addr, err := parseEndpoint(endpoint)
 	if err != nil {
 		return nil, nil, err
@@ -70,7 +72,14 @@ func NewServer(endpoint string, tlsConfig *tls.Config, opts ...grpc.ServerOption
 		return nil, nil, err
 	}
 
-	opts = append(opts, grpc.UnaryInterceptor(pmemcommon.LogGRPCServer))
+	interceptors := []grpc.UnaryServerInterceptor{
+		pmemcommon.LogGRPCServer,
+	}
+	if csiMetricsManager != nil {
+		interceptors = append(interceptors,
+			connection.ExtendedCSIMetricsManager{CSIMetricsManager: csiMetricsManager}.RecordMetricsServerInterceptor)
+	}
+	opts = append(opts, grpc.ChainUnaryInterceptor(interceptors...))
 	if tlsConfig != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
 	}
@@ -145,16 +154,25 @@ func serverConfig(certPool *x509.CertPool, peerCert *tls.Certificate, peerName s
 						// All names allowed.
 						return nil
 					}
+
 					if len(verifiedChains) == 0 ||
 						len(verifiedChains[0]) == 0 {
 						return errors.New("no valid certificate")
 					}
-					commonName := verifiedChains[0][0].Subject.CommonName
-					klog.Infof("VerifyPeerCertificate: CN=%s", commonName)
-					if commonName != peerName {
-						return fmt.Errorf("expected CN %q, got %q", peerName, commonName)
+
+					for _, name := range verifiedChains[0][0].DNSNames {
+						klog.Infof("VerifyPeerCertificate: DNSName=%s", name)
+						if name == peerName {
+							return nil
+						}
 					}
-					return nil
+					// For backword compatibility - using CN as hostName
+					commonName := verifiedChains[0][0].Subject.CommonName
+					if commonName == peerName {
+						klog.Warningf("Use of CommonName certificates is deprecated; Use a SAN certificate instead.")
+						return nil
+					}
+					return fmt.Errorf("certificate is not signed for %q hostname", peerName)
 				},
 			}
 			if peerName != "" {

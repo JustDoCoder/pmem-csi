@@ -35,13 +35,33 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+// DynamicDriver has the ability to return a modified copy of itself with additional options set.
+type DynamicDriver interface {
+	testsuites.TestDriver
+
+	// WithStorageClassNameSuffix sets a suffix which gets added
+	// to the name of all future storage classes that
+	// GetDynamicProvisionStorageClass creates. Can be used to
+	// create more than one class per test.
+	WithStorageClassNameSuffix(suffix string) DynamicDriver
+
+	// WithParameters sets parameters that are used in future
+	// storage classes and CSI inline volumes.
+	WithParameters(parameters map[string]string) DynamicDriver
+}
+
+// CSIDriver exposes the CSI driver name, something that is normally hidden.
+type CSIDriver interface {
+	GetCSIDriverName(config *testsuites.PerTestConfig) string
+}
+
 func New(name, csiDriverName string, fsTypes []string, scManifests map[string]string) testsuites.TestDriver {
 	if fsTypes == nil {
 		fsTypes = []string{"", "ext4", "xfs"}
 	}
 	if scManifests == nil {
 		scManifests = map[string]string{
-			"":     "deploy/common/pmem-storageclass-ext4.yaml",
+			"":     "deploy/common/pmem-storageclass-default.yaml",
 			"ext4": "deploy/common/pmem-storageclass-ext4.yaml",
 			"xfs":  "deploy/common/pmem-storageclass-xfs.yaml",
 		}
@@ -79,11 +99,14 @@ type manifestDriver struct {
 	manifests     []string
 	scManifest    map[string]string
 	cleanup       func()
+	scSuffix      string
+	parameters    map[string]string
 }
 
 var _ testsuites.TestDriver = &manifestDriver{}
 var _ testsuites.DynamicPVTestDriver = &manifestDriver{}
 var _ testsuites.EphemeralTestDriver = &manifestDriver{}
+var _ DynamicDriver = &manifestDriver{}
 
 func (m *manifestDriver) GetDriverInfo() *testsuites.DriverInfo {
 	return &m.driverInfo
@@ -105,13 +128,24 @@ func (m *manifestDriver) GetDynamicProvisionStorageClass(config *testsuites.PerT
 	Expect(err).NotTo(HaveOccurred())
 	Expect(len(items)).To(Equal(1), "exactly one item from %s", scManifest)
 
-	err = utils.PatchItems(f, items...)
+	err = utils.PatchItems(f, f.Namespace, items...)
 	Expect(err).NotTo(HaveOccurred())
 	err = utils.PatchCSIDeployment(f, m.finalPatchOptions(f), items[0])
 
 	sc, ok := items[0].(*storagev1.StorageClass)
 	Expect(ok).To(BeTrue(), "storage class from %s", scManifest)
 	sc.Provisioner = m.csiDriverName
+	sc.Name = config.Prefix + "-" + sc.Name
+
+	// Add additional parameters, if any.
+	for name, value := range m.parameters {
+		if sc.Parameters == nil {
+			sc.Parameters = map[string]string{}
+		}
+		sc.Parameters[name] = value
+	}
+	sc.Name += m.scSuffix
+
 	return sc
 }
 
@@ -139,7 +173,7 @@ func (m *manifestDriver) PrepareTest(f *framework.Framework) (*testsuites.PerTes
 	}
 
 	By(fmt.Sprintf("deploying %s driver", m.driverInfo.Name))
-	cleanup, err := utils.CreateFromManifests(f, func(item interface{}) error {
+	cleanup, err := utils.CreateFromManifests(f, f.Namespace, func(item interface{}) error {
 		return utils.PatchCSIDeployment(f, m.finalPatchOptions(f), item)
 	},
 		m.manifests...,
@@ -164,8 +198,12 @@ func (m *manifestDriver) GetVolume(config *testsuites.PerTestConfig, volumeNumbe
 	attributes := map[string]string{"size": m.driverInfo.SupportedSizeRange.Min}
 	shared := false
 	readOnly := false
+	// TODO (?): this trick with the driver name might no longer be necessary.
 	if strings.HasSuffix(m.driverInfo.Name, "-kata") {
 		attributes["kataContainers"] = "true"
+	}
+	for name, value := range m.parameters {
+		attributes[name] = value
 	}
 
 	return attributes, shared, readOnly
@@ -175,4 +213,16 @@ func (m *manifestDriver) GetCSIDriverName(config *testsuites.PerTestConfig) stri
 	// Return real driver name.
 	// We can't use m.driverInfo.Name as its not necessarily the real driver name
 	return m.csiDriverName
+}
+
+func (m *manifestDriver) WithParameters(parameters map[string]string) DynamicDriver {
+	m2 := *m
+	m2.parameters = parameters
+	return &m2
+}
+
+func (m *manifestDriver) WithStorageClassNameSuffix(suffix string) DynamicDriver {
+	m2 := *m
+	m2.scSuffix = suffix
+	return &m2
 }

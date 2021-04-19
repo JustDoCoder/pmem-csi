@@ -1,0 +1,188 @@
+# Generated with "make kustomize", do not edit!
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pmem-csi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pmem-csi-operator
+  namespace: pmem-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pmem-csi-operator-event
+  namespace: default
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - '*'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  creationTimestamp: null
+  name: pmem-csi-operator
+  namespace: pmem-csi
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - services
+  - services/finalizers
+  - serviceaccounts
+  - endpoints
+  - events
+  - secrets
+  - pods
+  verbs:
+  - '*'
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  - statefulsets
+  verbs:
+  - '*'
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - roles
+  - rolebindings
+  verbs:
+  - '*'
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - secrets
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pmem-csi-operator
+rules:
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterroles
+  - clusterrolebindings
+  verbs:
+  - '*'
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - csidrivers
+  verbs:
+  - '*'
+- apiGroups:
+  - pmem-csi.intel.com
+  resources:
+  - pmemcsideployments
+  - pmemcsideployments/status
+  - pmemcsideployments/finalizers
+  verbs:
+  - '*'
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - mutatingwebhookconfigurations
+  verbs:
+  - '*'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pmem-csi-operator-event
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pmem-csi-operator-event
+subjects:
+- kind: ServiceAccount
+  name: pmem-csi-operator
+  namespace: pmem-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pmem-csi-operator
+  namespace: pmem-csi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pmem-csi-operator
+subjects:
+- kind: ServiceAccount
+  name: pmem-csi-operator
+  namespace: pmem-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pmem-csi-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pmem-csi-operator
+subjects:
+- kind: ServiceAccount
+  name: pmem-csi-operator
+  namespace: pmem-csi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pmem-csi-operator
+  namespace: pmem-csi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: pmem-csi-operator
+  template:
+    metadata:
+      labels:
+        app: pmem-csi-operator
+        name: pmem-csi-operator
+        pmem-csi.intel.com/webhook: ignore
+    spec:
+      containers:
+      - command:
+        - /usr/local/bin/pmem-csi-operator
+        - -v=3
+        env:
+        - name: WATCH_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OPERATOR_NAME
+          value: pmem-csi-operator
+        - name: GODEBUG
+          value: x509ignoreCN=0
+        image: intel/pmem-csi-driver:canary
+        imagePullPolicy: IfNotPresent
+        name: pmem-csi-operator
+        securityContext:
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+      serviceAccountName: pmem-csi-operator
+      volumes:
+      - emptyDir: {}
+        name: tmp

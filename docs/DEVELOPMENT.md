@@ -1,4 +1,4 @@
-# Develop and contribute
+# Develop and Contribute
 
 - [Setup](#setup)
     - [Build PMEM-CSI](#build-pmem-csi)
@@ -9,24 +9,22 @@
     - [Branching](#branching)
     - [Tagging](#tagging)
     - [Release checklist](#release-checklist)
+    - [Release PMEM-CSI operator](#release-pmem-csi-operator)
 - [APIs](#apis)
     - [CSI API](#csi-api)
     - [Network ports](#network-ports)
     - [Local sockets](#local-sockets)
     - [Command line arguments](#command-line-arguments)
-    - [Common arguments](#common-arguments)
-    - [Specific arguments to pmem-ns-init](#specific-arguments-to-pmem-ns-init)
-    - [Specific arguments to pmem-vgm](#specific-arguments-to-pmem-vgm)
-    - [Specific arguments to pmem-csi-driver](#specific-arguments-to-pmem-csi-driver)
     - [Environment variables](#environment-variables)
     - [Logging](#logging)
+- [Performance and resource measurements](#performance-and-resource-measurements)
 - [Switching device mode](#switching-device-mode)
     - [Going from LVM device mode to direct device mode](#going-from-lvm-device-mode-to-direct-device-mode)
     - [Going from direct device mode to LVM device mode](#going-from-direct-device-mode-to-lvm-device-mode)
 - [Accessing system directories in a container](#accessing-system-directories-in-a-container)
     - [Read-only access to /sys](#read-only-access-to-sys)
     - [Access to /dev of host](#access-to-dev-of-host)
-- [Repository elements which are generated or created separately](#repository-elements-which-are-generated-or-created-separately)
+- [Repository elements that are generated or created separately](#repository-elements-which-are-generated-or-created-separately)
     - [Top-level README diagrams describing LVM and Direct device modes](#top-level-readme-diagrams-describing-lvm-and-direct-device-modes)
     - [Top-level README diagram describing communication channels](#top-level-readme-diagram-describing-communication-channels)
     - [Diagrams describing provisioning sequence](#diagrams-describing-provisioning-sequence)
@@ -38,54 +36,58 @@
 
 ### Build PMEM-CSI
 
-1.  Use `make build-images` to produce Docker container images.
+1.  Use `make build-images` to produce Docker\* container images.
 
-2.  Use `make push-images` to push Docker container images to a Docker image registry. The
-    default is to push to a local [Docker registry](https://docs.docker.com/registry/deploying/).
-    Some other registry can be configured by setting the variables described in
-    in the [test-config.sh](/test/test-config.sh) file, see the [configuration options](autotest.md#configuration-options)
-    section below. Alternatively, the registry can also be set with a make variable:
+2.  Use `make push-images` to push Docker container images to a Docker image
+    registry. The default is to push to a local
+    [Docker registry](https://docs.docker.com/registry/deploying/).
+    Other registries can be configured by setting the variables
+    described in the [test-config.sh](/test/test-config.sh) file. See the
+    [configuration options](autotest.md#configuration-options)
+    section below. Alternatively, the registry can also be set with a make
+    variable:
     `make push-images REGISTRY_NAME=my-registry:5000`
 
 See the [Makefile](/Makefile) for additional make targets and possible make variables.
 
-The source code gets developed and tested using the version of Go that
-is set with `GO_VERSION` in the [Dockerfile](/Dockerfile). Some other
-version may or may not work. In particular, `test_fmt` and
+The source code is developed and tested using the version of Go that
+is set with `GO_VERSION` in the [Dockerfile](/Dockerfile). Other
+versions may or may not work. In particular, `test_fmt` and
 `test_vendor` are known to be sensitive to the version of Go.
 
 ## Code quality
 
 ### Coding style
 
-The normal Go style guide applies. It is enforced by `make test`, which calls `gofmt`.
+The normal Go style guide applies and is enforced by `make test`, which
+calls `gofmt`.
 
 
 ### Input validation
 
-In all cases, input comes from a trusted source because network
-communication is protected by mutual TLS and the `kubectl` binaries
-runs with the same privileges as the user invoking it.
+In most cases, input comes from a trusted source because network
+communication is protected by mutual TLS. The `kubectl` binaries
+run with the same privileges as the user invoking it.
 
 Nonetheless, input needs to be validated to catch mistakes:
 
-- detect incorrect parameters for `kubectl`
-- ensure that messages passed to gRPC API implementations
-  in registry, controller and driver have all required
-  fields
-- the gRPC implementation rejects incoming messages that are too large
+- Detect incorrect parameters for `kubectl`
+- Ensure that messages passed to gRPC API implementations
+  in registry, controller, and driver have all required fields
+- The gRPC implementation rejects incoming messages that are too large
   (https://godoc.org/google.golang.org/grpc#MaxRecvMsgSize) and
   refuses to send messages that are larger
   (https://godoc.org/google.golang.org/grpc#MaxSendMsgSize)
+- Webhook and metrics SDK code validates input before invoking PMEM-CSI
 
 ## Release management
 
 ### Branching
 
 The `master` branch is the main branch. It is guaranteed to have
-passed full CI testing. However, it always uses the latest Clear Linux
-for building container images, so changes in Clear Linux can break the
-building of older revisions.
+passed full CI testing. However, the Dockerfile uses whatever is
+the latest upstream content for the base distribution and therefore
+tests results are not perfectly reproducible.
 
 The `devel` branch contains additional commits on top of `master`
 which might not have been tested in that combination yet. Therefore it
@@ -94,35 +96,33 @@ advanced via a fast-forward merge after successful testing by the CI job
 that rebuilds and tests the `devel` branch.
 
 Code changes are made via pull requests against `devel`. Each of them
-will get tested separately by the CI system before merging, but only a
+will be tested separately by the CI system before merging, but only a
 subset of the tests can be run due to time constraints.
 
 Beware that after merging one PR, the existing pre-merge tests results
 for other PRs become stale because they were based on the old `devel`
 branch. Because `devel` is allowed to be less stable than `master`, it
 is okay to merge two PRs quickly after one another without
-retesting. If two PRs that merged that don't have code conflicts
-(which would get detected by GitHub) but which nonetheless don't work
+retesting. If two merged PRs don't have code conflicts
+(which would be detected by GitHub\*) but nonetheless don't work
 together, the combined testing in the `devel` branch will find
-that. This will block updating `master` and thus needs to be dealt
+that. This blocks updating `master` and thus needs to be dealt with
 quickly.
 
 Releases are created by branching `release-x.y` from `master` or some
-older, stable revision. On that new branch, the base image is locked
-onto a certain Clear Linux version with the
-`hack/update-clear-linux-base.sh` script. Those `release-x.y` branches
-are then fully reproducible. The actual `vx.y.z` release tags are set
+older, stable revision. The actual `vx.y.z` release tags are set
 on revisions in the corresponding `release-x.y` branch.
 
 Releases and the corresponding images are never changed. If something
-goes wrong after setting a tag (like detecting a bug while testing the
+goes wrong after setting a tag (such as detecting a bug while testing the
 release images), a new release is created.
 
-Container images reference a fixed base image. To ensure that the base
-image remains secure, `hack/update-clear-linux-base.sh` gets run
-periodically to update a `release-x.y` branch and a new release with
-`z` increased by one is created. Other bug fixed might be added to
-that release by merging into the branch.
+Container images reference a floating base image. Whatever version of
+that was current at the time of building the PMEM-CSI image then
+serves as base for the release. To ensure that the release image
+remains secure, it is scanned for known vulnerabilities regularly and
+a new release is prepared manually, if needed. The new release then
+uses a newer base image.
 
 ### Tagging
 
@@ -134,14 +134,13 @@ tagged releases then use the image that corresponds to that release.
 The `hack/set-version.sh` script can be used to set these versions.
 The modified files then need to be committed. Merging such a commit
 triggers a rebuild of the `devel` branch, but does not yet produce a
-release: the actual image only gets pushed when there is a tag that
+release; the actual image is pushed only when there is a tag that
 corresponds to the version embedded in the source code. The
 Jenkinsfile ensures that.
 
 ### Release checklist
 
 * Create a new `release-x.y` branch.
-* Run `hack/update-clear-linux-base.sh`.
 * Run `hack/set-version.sh vx.y.z` and commit the modified files.
 * Push to `origin`.
 * [Create a draft
@@ -154,33 +153,66 @@ Jenkinsfile ensures that.
   and promotion of the resulting images to [Docker
   Hub](https://hub.docker.com/r/intel/pmem-csi-driver/tags?page=1&ordering=last_updated).
 * Publish the GitHub release.
+* Run `hack/merge-release.sh` on the "devel" branch and push the
+  fabricated merge commit. This documents that "devel" is at least
+  as recent as the new release.
+* On the devel branch, add the new release to the main README.md and
+  `.github/workflows/publish.yml`. Merge into devel, then cherry-pick
+  into *all* release branches that might still get changes. Otherwise
+  building the old release will cause the docsite to be generated
+  without the new release.
+
+### Release PMEM-CSI operator
+
+Follow the steps below to publish new operator release to
+[OperatorHub](https://operatorhub.io):
+
+* Generate OLM catalog for new release
+``` console
+$ make operator-generate-catalog VERSION=<X.Y.Z> #semantic version number
+```
+Running the above command generates the OLM catalog files under `deploy/olm-catalog/<X.Y.Z>`
+
+* Clone `operator-framework/community-operators` repository
+``` console
+$ git clone https://github.com/operator-framework/community-operators.git
+```
+
+* Copy the generated catalog files. Commit the changes and submit a pull
+  request to
+ [community-operators](https://github.com/operator-framework/community-operators) repository.
+```console
+$ cp -r <PMEM-CSI_ROOT>/deploy/olm-catalog/* <COMMUNITY-OPERATORS_ROOT>/upstream-community-operators/pmem-csi-operator/
+$ cd <COMMUNITY-OPERATORS_ROOT>
+$ git add upstream-community-operators/pmem-csi-operator/
+$ git commit -s -m "Updating PMEM-CSI Operator to version <X.Y.Z>"
+```
 
 ## APIs
 
 ### CSI API
 
-Kubernetes CSI API is exposed over Unix domain socket. CSI operations
+Kubernetes\* CSI API is exposed over a Unix domain socket. CSI operations
 are executed as gRPC calls. Input data is allowed as permitted by CSI
-specification. Output data is formatted as gRPC response.
+specification. Output data is formatted as a gRPC response.
 
-Following CSI operations are supported, with arguments as specified by
-CSI specification: CreateVolume, DeleteVolume, StageVolume,
+The following CSI operations are supported, with arguments specified by
+the CSI specification: CreateVolume, DeleteVolume, StageVolume,
 UnstageVolume, PublishVolume, UnpublishVolume, ListVolumes,
-GetCapacity, GetCapabilities, GetPluginInfo, GetPluginCapabilities.
+GetCapacity, GetCapabilities, GetPluginInfo, and GetPluginCapabilities.
 
 
 ### Network ports
 
 Network ports are opened as configured in manifest files:
 
-- registry endpoint: typical port value 10000, used for PMEM-CSI internal communication
-- controller endpoint: typical port value 10001, used for serving CSI API
+- metrics endpoint: typical port values 10010 (PMEM-CSI) and 10011
+  (external-provisioner)
 - webhook endpoint: disabled by default, port chosen when [enabling the scheduler extensions](../README.md#enable-scheduler-extensions)
-
 
 ### Local sockets
 
-Kubernetes CSI API used over local socket inside same host.
+The Kubernetes CSI API is used over a local socket inside the same host.
 
 - unix:///var/lib/kubelet/plugins/pmem-csi-reg.sock
 - unix:///var/lib/kubelet/plugins/pmem-csi/csi.sock
@@ -189,183 +221,163 @@ Kubernetes CSI API used over local socket inside same host.
 
 ### Command line arguments
 
-Note that different set of programs is used in different
-device modes. Three stages: *pmem-ns-init*, *pmem-vgm*,
-*pmem-csi-driver* run in LVM device mode. Only *pmem-csi-driver* runs
-in direct device mode.
-
-### Common arguments
-
-argument name            | meaning                                           | type   | range
--------------------------|---------------------------------------------------|--------|---
--alsologtostderr         | log to standard error as well as files            |        |
--log_backtrace_at value  | when logging hits line file:N, emit a stack trace |        |
--log_dir string          | If non-empty, write log files in this directory   | string |
--log_file string         | If non-empty, use this log file                   | string |
--logtostderr             | log to standard error instead of files            |        |
--skip_headers            | avoid header prefixes in the log messages         |        |
--stderrthreshold value   | logs at or above this threshold go to stderr (default 2) | |
--v value                 | log level for V logs                              | int    |
--vmodule value           | comma-separated list of pattern=N settings for file-filtered logging | string |
-
-### Specific arguments to pmem-ns-init
-
-argument name      | meaning                                                | type | range
--------------------|--------------------------------------------------------|------|---
--useforfsdax int   | Percentage of total to use in Fsdax mode (default 100) | int  | 0..100
-
-### Specific arguments to pmem-vgm
-
-NO SPECIFIC arguments
-
-### Specific arguments to pmem-csi-driver
-
-argument name        | meaning                                           | type | allowed | default
----------------------|---------------------------------------------------|------|---------|---
--caFile string       | Root CA certificate file to use for verifying connections | string | |
--certFile string     | SSL certificate file to use for authenticating client connections(RegistryServer/NodeControllerServer) | string | |
--clientCertFile string | Client SSL certificate file to use for authenticating peer connections | string | | certFile
--clientKeyFile string | Client private key associated to client certificate | string |              | keyFile
--controllerEndpoint string | internal node controller endpoint              | string |              |
--deviceManager string      | device mode to use. ndctl selects mode which is described as direct mode in documentation. | string | lvm or ndctl | lvm
--drivername string         | name of the driver                             | string |              | pmem-csi
--endpoint string           | PMEM CSI endpoint                              | string |              | unix:///tmp/pmem-csi.sock
--keyFile string            | Private key file associated to certificate     | string |              |
--mode string               | driver run mode                                | string | controller, node |
--nodeid string             | node id                                        | string |              | nodeid
--registryEndpoint string   | endpoint to connect/listen registry server     | string |              |
--statePath                 | Directory path where to persist the state of the driver running on a node | string | absolute directory path on node | /var/lib/<drivername>
--schedulerListen           | listen address for scheduler extender and mutating webhook | [address string](https://golang.org/pkg/net/#Listen) | controller | empty (= disabled)
+See the `main.go` files of the
+[pmem-csi-driver](./pkg/pmem-csi-driver/main.go) and
+the [pmem-csi-operator](./pkg/pmem-csi-operator/main.go) commands.
 
 ### Environment variables
 
-TEST_WORK is used by registry server unit-test code to specify path to certificates in test system. 
-Note, THIS IS NOT USED IN PRODUCTION
+TEST_WORK is used by registry server unit-test code to specify the path to
+certificates in the test system.
+
+>Note: THIS IS NOT USED IN PRODUCTION.
+
+NODE_NAME is a copy of the node name set for the pod which runs the
+`external-provisioner` on each node.
 
 ### Logging
 
 The klog.Info statements are used via the verbosity checker using the following levels:
-- klog.V(3) - Generic information. Level 3 is the default Info log level in pmem-csi, and example deployment files set this level for production configuration.
+- klog.V(3) - Generic information. Level 3 is the default Info log level in
+  pmem-csi, and example deployment files set this level for production
+  configuration.
 - klog.V(4) - Elevated verbosity messages.
-- klog.V(5) - Even more verbose messages, useful for debugging and issue resolving. This level is used in testing type of deployment examples.
+- klog.V(5) - Even more verbose messages, useful for debugging and issue
+  resolving. This level is used in testing type of deployment examples.
 
-There are also messages using klog.Warning, klog.Error and klog.Fatal, and their formatted counterparts.
+These are *not* the same levels as in the [Kubernetes logging conventions](https://github.com/kubernetes/community/blob/4eeba4d57bed01502cb09598a74d21671d4ee876/contributors/devel/sig-instrumentation/logging.md).
 
-## Switching device mode
+There are also messages using klog.Warning, klog.Error, klog.Fatal,
+and their formatted counterparts.
 
-If device mode is switched between LVM and direct(aka ndctl), please keep
-in mind that PMEM-CSI driver does not clean up or reclaim namespaces,
-therefore namespaces plus other related context (LVM state)
-created in previous mode will remain stored on device and most likely
-will create trouble in another device mode.
+## Performance and resource measurements
 
-### Going from LVM device mode to direct device mode
+The [metrics
+server](https://github.com/kubernetes-sigs/metrics-server) is needed
+for `kubectl top node` and `kubectl top pod`. In the QEMU cluster it
+has to be installed with insecure TLS because of
+https://github.com/kubernetes/kubeadm/issues/2028. This can be done with:
 
-- examine LV groups state on a node: `vgs`
-- examine LV physical volumes state on a node: `pvs`
-- delete LV groups before deleting namespaces to avoid orphaned volume groups: `vgremove VGNAME`
+```console
+kustomize build deploy/kustomize/metrics-server | kubectl create -f -
+```
 
-NOTE: The following **WILL DELETE ALL NAMESPACES** so be careful!
+The `Vertical Pod Autoscaler` can be used to determine resource
+requirements of the PMEM-CSI pods. The `hack/setup-va.sh` script
+checks out the source code under `_work` and installs it.
 
-- Delete namespaces on a node using CLI: `ndctl destroy-namespace all --force`
+For PMEM-CSI running in the default namespace, VPA can be instructed
+to provide recommendations with:
 
-### Going from direct device mode to LVM device mode
+```console
+kubectl apply -k deploy/kustomize/vpa-for-pmem-csi/
+```
 
-No special steps are needed to clean up namespaces state.
+Resource requirements depend on the workload. To generate some load, run
+```console
+make test_e2e TEST_E2E_FOCUS=lvm-production.*late.binding.*stress.test
+```
 
-If PMEM-CSI driver has been operating correctly, there should not be
-existing namespaces as CSI volume lifecycle should have been deleted
-those after end of life of volume. If there are, you can either keep
-those (LVM device mode does honor "foreign" namespaces and leaves those
-alone) if you have enough space, or you can choose to delete those
-using `ndctl` on node.
+Alternatively, one can run the
+[`hack/stress-driver.sh`](hack/stress-driver.sh)
+helper script to generate load on the driver
+```console
+ROUNDS=500 VOL_COUNT=5 ./hack/stress-driver.sh
+```
+
+Now resource recommendations can be retrieved with:
+
+```console
+kubectl get vpa
+kubectl describe vpa
+kubectl get vpa pmem-csi-node -o jsonpath='{range .status.recommendation.containerRecommendations[*]}{.containerName}{":\n\tRequests: "}{.lowerBound}{"\n\tLimits: "}{.upperBound}{"\n"}{end}'
+```
+
+The default resource requirements used for the driver deployments by the
+operator are chosen from the VPA recommendations described in this section
+when using the `stress-driver.sh` script.
 
 ## Accessing system directories in a container
 
-The PMEM-CSI driver will run as container, but it needs access to
-system directories /sys and /dev. Two related potential problems have
-been diagnosed so far.
+The PMEM-CSI driver runs as a container, but it needs access to
+system directories /sys and /dev. Two related potential problems that have
+been diagnosed so far are listed below.
 
 ### Read-only access to /sys
 
-In some deployment schemes /sys remains mounted read-only in the
-container running pmsm-csi-driver. This creates problem for the
-driver which needs write access to /sys for namespaces management
+In some deployment schemes, /sys remains mounted read-only in the
+container running pmsm-csi-driver. This creates a problem for the
+driver that needs write access to /sys for namespaces management
 operations. There is start-time check for read-write mount of /sys in
-the code. An error in pod log `pmem-driver: Failed to run driver:
-FATAL: /sys mounted read-only, can not operate` is the sign of such
+the code. An error in the pod log `pmem-driver: Failed to run driver:
+FATAL: /sys mounted read-only, can not operate` is the sign of such a
 state.
 
 ### Access to /dev of host
 
 Containers runtime may not pass /dev from host into the
-container. If the /dev/ of the host is not accessible in the PMEM-CSI container, there will be
-failure in accessing of newly created block device /dev/pmemX.Y which
-will not be visible inside container. The driver does not detect the
-root cause of that problem during start-up, but only when a volume
-creation has failed. This problem can be avoided by specifying
+container. If the /dev/ of the host is not accessible in the PMEM-CSI
+container, access will fail to the newly created block device /dev/pmemX.Y
+which will not be visible inside the container. The driver does not detect
+the root cause of that problem during start-up, but only when a volume
+creation has failed. This problem can be avoided by specifying an
 explicit mount of /dev in the PMEM-CSI manifest.
 
-## Repository elements which are generated or created separately
+## Repository elements that are generated or created separately
 
-Here are creation and update notes for these elements in the repository
-which are not hand-edited
+Here are creation and update notes for the elements in the repository
+that are not hand-edited.
 
 ### Top-level README diagrams describing LVM and Direct device modes
 
-Two diagrams are created with [_dia_ drawing program](https://en.wikipedia.org/wiki/Dia_(software)).
+Two diagrams are created with
+[_dia_ drawing program](https://en.wikipedia.org/wiki/Dia_(software)).
 The [single source file](/docs/diagrams/pmem-csi.dia) has
-layers: {common, lvm, direct} so that two diagram variants can be produced from single source.
-Image files are produced by saving in PNG format with correct set of layers visible.
-The PNG files are committed as repository elements in docs/images/devicemodes/.
+layers: {common, lvm, direct} so that two diagram variants can be produced
+from a single source. Image files are produced by saving in PNG format with
+correct set of layers visible.
+The PNG files are committed as repository elements in
+docs/images/devicemodes/.
 
 ### Top-level README diagram describing communication channels
 
-This diagram was created with the [_dia_ drawing program](https://en.wikipedia.org/wiki/Dia_(software)) using [source file](/docs/diagrams/pmem-csi-communication-diagram.dia).
+This diagram was created with the
+[_dia_ drawing program](https://en.wikipedia.org/wiki/Dia_(software)) using
+a [source file](/docs/diagrams/pmem-csi-communication-diagram.dia).
 
-Image file is produced by saving in PNG format.
-The PNG file is committed as a [repository element](/docs/images/communication/pmem-csi-communication-diagram.png).
+An image file is produced by saving in PNG format.
+The PNG file is committed as a
+[repository element](/docs/images/communication/pmem-csi-communication-diagram.png).
 
 ### Diagrams describing provisioning sequence
 
-Two diagrams are generated using [plantuml program](http://plantuml.com/).
+Two diagrams are generated using the
+[plantuml program](http://plantuml.com/).
 Source files:
 - [source file for regular sequence](/docs/diagrams/sequence.wsd)
 - [source file for cache sequence](/docs/diagrams/sequence-cache.wsd)
 
 The PNG files are committed as repository elements in docs/images/sequence/.
 
-### RegistryServer spec
-
-pkg/pmem-registry/pmem-registry.pb.go is generated from pkg/pmem-registry/pmem-registry.proto
-
-protoc comes from package _protobuf-compiler_ on Ubuntu 18.04
-- get protobuf for Go:
-```sh
-$ git clone https://github.com/golang/protobuf.git && cd protobuf
-$ make # installs needed binary in $GOPATH/bin/protoc-gen-go
-```
-
-- generate by running in \~/go/src/github.com/intel/pmem-csi/pkg/pmem-registry:
-
-```sh
-protoc --plugin=protoc-gen-go=$GOPATH/bin/protoc-gen-go --go_out=plugins=grpc:./ pmem-registry.proto
-```
-
 ### Table of Contents in README and DEVELOPMENT
 
-Table of Contents can be generated using multiple methods.
-- One possibility is to use [pandoc](https://pandoc.org/)
+A Table of Contents (TOC) can be generated using multiple methods.
 
-```sh
-$ pandoc -s -t markdown_github --toc README.md -o /tmp/temp.md
-```
+- One method  is to use [pandoc](https://pandoc.org/)
 
-Then check and hand-pick generated TOC part(s) from /tmp/temp.md and insert in desired location.
-Note that pandoc is known to produce incorrect TOC entries if headers contain special characters,
-means TOC generation will be more reliable if we avoid non-letter-or-number characters in the headers.
+    ``` console
+    $ pandoc -s -t markdown_github --toc README.md -o /tmp/temp.md
+    ```
 
-- Another method is to use emacs command markdown-toc-generate-toc and manually check and edit the generated part: we do not show generated 3rd-level headings in README.md.
+    Then check and hand-pick generated TOC part(s) from /tmp/temp.md and insert
+    them in the desired location.
+    Note that pandoc is known to produce incorrect TOC entries if headers
+    contain special characters. This means that TOC generation will be more
+    reliable if we avoid non-letter-or-number characters in the headers.
+
+- Another method is to use the emacs command markdown-toc-generate-toc and
+  manually check and edit the generated part: we do not show generated
+  third-level headings in README.md.
 
 ## Build, edit, and deploy the Read the Docs site
 
@@ -373,20 +385,20 @@ The PMEM-CSI documentation is available as in-repo READMEs and as a GitHub\*
 hosted [website](https://intel.github.io/pmem-csi). The website is created
 using the [Sphinx](https://www.sphinx-doc.org/) documentation generator and
 the well-known [Read the Docs](https://sphinx-rtd-theme.readthedocs.io/)
-theme. 
+theme.
 
 ### Build
 
-Building the documentation requires Python 3.x and venv.
+Building the documentation requires Python\* 3.x and venv.
 
-```bash
-make vhtml
+``` console
+$ make vhtml
 ```
 
 ### Edit
 
 Sphinx uses [reStructuredText](https://docutils.sourceforge.io/docs/ref/rst/restructuredtext.html) (reST) as the primary document source type but can be
-extended to use Markdown by adding the ``recommonmark`` and 
+extended to use Markdown by adding the ``recommonmark`` and
 ``sphinx_markdown_tables`` extensions (see [conf.json](/conf.json)).
 
 Change the navigation tree or add documents by updating the ``toctree``. The
@@ -406,10 +418,10 @@ main ``toctree`` is in ``index.rst``:
 ```
 
 reST files, Markdown files, and URLs can be added to a ``toctree``. The
-``:maxdepth:`` argument dictates the number of header levels that will be
+``:maxdepth:`` argument dictates the number of header levels to be
 displayed on that page. This website replaces the ``index.html`` output of
 this project with a redirect to ``README.html`` (the conversion of the top
-level README) to closer match the in-repo documentation.
+level README) to more closely match the in-repo documentation.
 
 Any reST or Markdown file not referenced by a ``toctree`` will generate a
 warning in the build. This document has a ``toctree`` in:
@@ -421,16 +433,18 @@ Files or directories that are intentionally not referenced can be excluded
 in [`conf.json`](/conf.json).
 
 NOTE: Though GitHub can parse reST files, the ``toctree`` directive is Sphinx
-specific, so it is not understood by GitHub. ``examples/readme.rst`` is a good
-example. Adding the ``:hidden:`` argument to the ``toctree`` directive means
-that the ``toctree`` is not displayed in the Sphinx built version of the page.
+specific, so it is not understood by GitHub. ``examples/readme.rst`` is a
+good example. Adding the ``:hidden:`` argument to the ``toctree`` directive
+means that the ``toctree`` is not displayed in the Sphinx built version of
+the page.
 
 ### Custom link handling
 
 This project has some custom capabilities added to the [conf.py](/conf.py) to
 fix or improve how Sphinx generates the HTML site.
 
-1. Markdown files: Converts references to Markdown files that include anchors.
+1. Markdown files: Converts references to Markdown files that include
+anchors.
    ``` md
    [configuration options](autotest.md#configuration-options)
    ```
@@ -442,12 +456,13 @@ fix or improve how Sphinx generates the HTML site.
    ``` md
    [Application examples](examples/readme.rst)
    ```
-4. Markdown files: Fixes links to files and directories within the GitHub repo.
+4. Markdown files: Fixes links to files and directories within the GitHub
+   repo.
    ``` md
    [Makefile](/Makefile)
    [deploy/kustomize](/deploy/kustomize)
    ```
-   Links to files can be fixed one of two ways, which can be set in the
+   Links to files can be fixed in one of two ways, which can be set in the
    [conf.py](/conf.py). 
 
    ``` python
@@ -458,22 +473,25 @@ fix or improve how Sphinx generates the HTML site.
    ```
 
    If ``useGitHubURL`` is set to True, it will try to create links based on
-   your ``githubBaseURL`` and the SHA for the commit to the GitHub repo 
-   determined by the GitHub workflow on merge). If there is no SHA available,
+   your ``githubBaseURL`` and the SHA for the commit to the GitHub repo
+   determined by the GitHub workflow on merge. If there is no SHA available,
    it will use the value of ``baseBranch``.
 
    If ``useGitHubURL`` is set to False, it will copy the files to the HTML
    output directory and provide links to that location.
 
-   NOTE: Links to files and directories should use absolute paths relative to
-   the repo (see Makefile and deploy/kustomize above). This will work both for
-   the Sphinx build and when viewing in the GitHub repo.
+   NOTE: Links to files and directories should use absolute paths relative
+   to the repo (see Makefile and deploy/kustomize above). This will work
+   both for the Sphinx build and when viewing in the GitHub repo.
 
-   Links to directories are always converted to links to the GitHub repository.
+   Links to directories are always converted to links to the GitHub
+   repository.
 
 ### Deploying with GitHub actions
 
-The publish [workflow](/.github/workflows/publish.yml) is run each time a commit is made to the designated branch and pushes the rendered HTML to the gh-pages branch. Other rules can be created for other branches.
+The publish [workflow](/.github/workflows/publish.yml) is run each time a
+commit is made to the designated branch and pushes the rendered HTML to the
+gh-pages branch. Other rules can be created for other branches.
 
 ``` yaml
 on:
@@ -482,4 +500,6 @@ on:
         - devel
 ```
 
-NOTE: Create a secret called ``ACCESS_TOKEN`` in repo>settings>secrets with a [token](https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line) generated by a user with write privileges to enable the automated push to the gh-pages branch.
+NOTE: Create a secret called ``ACCESS_TOKEN`` in repo>settings>secrets with
+a [token](https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line) generated by a user
+with write privileges to enable the automated push to the gh-pages branch.

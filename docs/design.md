@@ -5,12 +5,12 @@
     - [LVM device mode](#lvm-device-mode)
     - [Direct device mode](#direct-device-mode)
     - [Kata Containers support](#kata-containers-support)
-    - [Driver modes](#driver-modes)
-    - [Driver Components](#driver-components)
+    - [Dynamic provisioning of local volumes](#dynamic-provisioning-of-local-volumes)
     - [Communication between components](#communication-between-components)
     - [Security](#security)
     - [Volume Persistency](#volume-persistency)
     - [Capacity-aware pod scheduling](#capacity-aware-pod-scheduling)
+    - [PMEM-CSI operator](#pmem-csi-operator)
         
 ## Architecture and Operation
 
@@ -23,7 +23,6 @@ There is a more detailed explanation in the following paragraphs.
 |Main advantage     |avoids free space fragmentation<sup>1</sup>   |simpler, somewhat faster, but free space may get fragmented<sup>1</sup>   |
 |What is served     |LVM logical volume     |pmem block device   |
 |Region affinity<sup>2</sup>    |yes: one LVM volume group is created per region, and a volume has to be in one volume group  |yes: namespace can belong to one region only  |
-|Startup            |two extra stages: pmem-ns-init (creates namespaces), vgm (creates volume groups)   |no extra steps at startup |
 |Namespace modes    |`fsdax` mode<sup>3</sup> namespaces pre-created as pools   |namespace in `fsdax` mode created directly, no need to pre-create pools   |
 |Limiting space usage | can leave part of device unused during pools creation  |no limits, creates namespaces on device until runs out of space  |
 | *Name* field in namespace | *Name* gets set to 'pmem-csi' to achieve own vs. foreign marking | *Name* gets set to VolumeID, without attempting own vs. foreign marking  |
@@ -66,34 +65,24 @@ group created per region, ensuring the region-affinity of served volumes.
 
 ![devicemode-lvm diagram](/docs/images/devicemodes/pmem-csi-lvm.png)
 
-The driver consists of three separate binaries that form two
-initialization stages and a third API-serving stage.
-
 During startup, the driver scans persistent memory for regions and
 namespaces, and tries to create more namespaces using all or part
-(selectable via option) of the remaining available space. This first
-stage is performed by a separate entity `pmem-ns-init`.
+(selectable via option) of the remaining available space. Later it 
+arranges physical volumes provided by namespaces into LVM volume groups.
 
-The second stage of initialization arranges physical volumes provided
-by namespaces into LVM volume groups. This is performed by a separate
-binary `pmem-vgm`.
-
-After two initialization stages, the third binary `pmem-csi-driver`
-starts serving CSI API requests.
-
-### Namespace modes in LVM device mode
+### [Namespace modes](https://docs.pmem.io/ndctl-user-guide/concepts/nvdimm-namespaces) in LVM device mode
 
 The PMEM-CSI driver pre-creates namespaces in `fsdax` mode forming
 the corresponding LVM volume group. The amount of space to be
-used is determined using the option `-useforfsdax` given to `pmem-ns-init`.
+used is determined using the option `-pmemPercentage` given to `pmem-csi-driver`.
 This options specifies an integer presenting limit as percentage.
-The default value is `useforfsdax=100`.
+The default value is `100`.
 
 ### Using limited amount of total space in LVM device mode
 
 The PMEM-CSI driver can leave space on devices for others, and
 recognize "own" namespaces. Leaving space for others can be achieved
-by specifying lower-than-100 value to `-useforfsdax` options 
+by specifying lower-than-100 value to `-pmemPercentage` option.
 The distinction "own" vs. "foreign" is
 implemented by setting the _Name_ field in namespace to a static
 string "pmem-csi" during namespace creation. When adding physical
@@ -112,10 +101,7 @@ device mapping layer. Direct mode also ensures the region-affinity of
 served volumes, because provisioned volume can belong to one region
 only.
 
-In Direct mode, the two preparation stages used in LVM mode, are not
-needed.
-
-### Namespace modes in direct device mode
+### [Namespace modes](https://docs.pmem.io/ndctl-user-guide/concepts/nvdimm-namespaces) in direct device mode
 
 The PMEM-CSI driver creates a namespace directly in the mode which is
 asked by volume creation request, thus bypassing the complexity of
@@ -127,7 +113,7 @@ In direct device mode, the driver does not attempt to limit space
 use. It also does not mark "own" namespaces. The _Name_ field of a
 namespace gets value of the VolumeID.
 
-## Kata Container support
+## Kata Containers support
 
 [Kata Containers](https://katacontainers.io) runs applications inside a
 virtual machine. This poses a problem for App Direct mode, because
@@ -152,7 +138,7 @@ This gets solved as follows:
   that filesystem normally *but* due to limitations in the Linux
   kernel, mounting might have to be done without `-odax` and thus
   App Direct access does not work.
-- When the Kata Container runtime is asked to provide access to that
+- When the Kata Containers runtime is asked to provide access to that
   filesystem, it will instead pass the underlying `pmem-csi-vm.img`
   file into QEMU as a [nvdimm
   device](https://github.com/qemu/qemu/blob/master/docs/nvdimm.txt)
@@ -164,92 +150,51 @@ This gets solved as follows:
 Such volumes can be used with full dax semantic *only* inside Kata
 Containers. They are still usable with other runtimes, just not
 with dax semantic. Because of that and the additional space overhead,
-Kata Container support has to be enabled explicitly via a [storage
+Kata Containers support has to be enabled explicitly via a [storage
 class parameter and Kata Containers must be set up
-appropriately](install.md#kata-containers-support)
+appropriately](install.md#kata-containers-support).
 
-## Driver modes
+## Dynamic provisioning of local volumes
 
-The PMEM-CSI driver supports running in different modes, which can be
-controlled by passing one of the below options to the driver's
-'_-mode_' command line option. In each mode, it starts a different set
-of open source Remote Procedure Call (gRPC)
-[servers](#driver-components) on given driver endpoint(s).
+Traditionally, Kubernetes expects that a driver deployment has a
+central component, usually implemented with the `external-provisioner`
+and a custom CSI driver component which implements volume creation.
+That central component is hard to implement for a CSI driver that
+creates volumes locally on a node.
 
-* **_Controller_** should run as a single instance in cluster level. When the
-  driver is running in _Controller_ mode, it forwards the pmem volume
-  create/delete requests to the registered node controller servers
-  running on the worker node. In this mode, the driver starts the
-  following gRPC servers:
+PMEM-CSI solves this problem by deploying `external-provisioner`
+alongside each node driver and enabling ["distributed
+provisioning"](https://github.com/kubernetes-csi/external-provisioner/tree/v2.1.0#deployment-on-each-node):
+- For volumes with storage classes that use late binding (aka "wait
+  for first consumer"), a volume is tentatively assigned to a node
+  before creating it, in which case the `external-provisioner` running
+  on that node can tell that it is responsible for provisioning.
+- The scheduler extensions help the scheduler with picking nodes where
+  volumes can be created. Without them, the risk of choosing nodes
+  without PMEM may be too high and manual pod scheduling may be needed
+  to avoid long delays when starting pods. In the future with
+  Kubernetes >= 1.21, [storage capacity
+  tracking](https://kubernetes.io/docs/concepts/storage/storage-capacity/)
+  will be another solution for that problem.
+- For volumes with storage classes that use immediate binding, the
+  different `external-provisioner` instances compete with each for
+  ownership of the volume by setting the "selected node"
+  annotation. Delays are used to avoid the thundering herd problem.
+  Once a node has been selected, provisioning continues as with late
+  binding. This is less efficient and therefore "late binding" is the
+  recommended binding mode. The advantage is that this mode does not
+  depend on scheduler extensions to put pods onto nodes with PMEM
+  because once a volume has been created, the pod will automatically
+  run on the node of the volume. The downside is that a volume might
+  have been created on a node which has insufficient RAM and CPU
+  resources for a pod.
 
-    * [IdentityServer](#identity-server)
-    * [NodeRegistryServer](#node-registry-server)
-    * [MasterControllerServer](#master-controller-server)
-
-* One **_Node_** instance should run on each
-  worker node that has persistent memory devices installed. When the
-  driver starts in such mode, it registers with the _Controller_
-  driver running on a given _-registryEndpoint_. In this mode, the
-  driver starts the following servers:
-
-    * [IdentityServer](#identity-server)
-    * [NodeControllerServer](#node-controller-server)
-    * [NodeServer](#node-server)
-
-## Driver Components
-
-### Identity Server
-
-This gRPC server operates on a given endpoint in all driver modes and
-implements the CSI [Identity
-interface](https://github.com/container-storage-interface/spec/blob/master/spec.md#identity-service-rpc).
-
-### Node Registry Server
-
-When the PMEM-CSI driver runs in _Controller_ mode, it starts a gRPC
-server on a given endpoint(_-registryEndpoint_) and serves the
-[RegistryServer](/pkg/pmem-registry/pmem-registry.proto) interface. The
-driver(s) running in _Node_ mode can register themselves with node
-specific information such as node id,
-[NodeControllerServer](#node-controller-server) endpoint, and their
-available persistent memory capacity.
-
-### Master Controller Server
-
-This gRPC server is started by the PMEM-CSI driver running in
-_Controller_ mode and serves the
-[Controller](https://github.com/container-storage-interface/spec/blob/master/spec.md#controller-service-rpc)
-interface defined by the CSI specification. The server responds to
-CreateVolume(), DeleteVolume(), ControllerPublishVolume(),
-ControllerUnpublishVolume(), and ListVolumes() calls coming from
-external-provisioner() and external-attacher() sidecars. It
-forwards the publish and unpublish volume requests to the appropriate
-[Node controller server](#node-controller-server) running on a worker
-node that was registered with the driver.
-
-### Node Controller Server
-
-This gRPC server is started by the PMEM-CSI driver running in _Node_
-mode and implements the
-[ControllerPublishVolume](https://github.com/container-storage-interface/spec/blob/master/spec.md#controllerpublishvolume)
-and
-[ControllerUnpublishVolume](https://github.com/container-storage-interface/spec/blob/master/spec.md#controllerunpublishvolume)
-methods of the [Controller
-service](https://github.com/container-storage-interface/spec/blob/master/spec.md#controller-service-rpc)
-interface defined by the CSI specification. It serves the
-ControllerPublishVolume() and ControllerUnpublish() requests coming
-from the [Master controller server](#master-controller-server) and
-creates/deletes persistent memory devices.
-
-### Node Server
-
-This gRPC server is started by the driver running in _Node_ mode and
-implements the [Node
-service](https://github.com/container-storage-interface/spec/blob/master/spec.md#node-service-rpc)
-interface defined in the CSI specification. It serves the
-NodeStageVolume(), NodeUnstageVolume(), NodePublishVolume(), and
-NodeUnpublishVolume() requests coming from the Container Orchestrator
-(CO).
+PMEM-CSI also has a central component which implements the [scheduler
+extender](#scheduler-extender) webhook. That component needs to know
+on which nodes the PMEM-CSI driver is running and how much capacity is
+available there. This information is retrieved by dynamically
+discovering PMEM-CSI pods and connecting to their [metrics
+endpoint](/docs/install.md#metrics-support).
 
 ## Communication between components
 
@@ -258,18 +203,17 @@ The following diagram illustrates the communication channels between driver comp
 
 ## Security
 
-All PMEM-CSI specific communication [shown in above
-section](#communication-between-components) between Master
-Controller([RegistryServer](#node-registry-server),
-[MasterControllerServer](#master-controller-server)) and
-NodeControllers([NodeControllerServer](#node-controller-server)) is
-protected by mutual TLS. Both client and server must identify
-themselves and the certificate they present must be trusted. The
-common name in each certificate is used to identify the different
-components. The following common names have a special meaning:
+The data exposed via the [metrics
+endpoint](/docs/install.md#metrics-support) is not considered
+confidential and therefore offered without access control via
+HTTP. This also simplifies scraping that data with tools like
+Prometheus.
 
-- `pmem-registry` is used by the [RegistryServer](#node-registry-server).
-- `pmem-node-controller` is used by [NodeControllerServers](#node-controller-server)
+The communication between Kubernetes and the scheduler extender
+webhook is protected by TLS because this is encouraged and supported
+by Kubernetes. But as the webhook only exposes information that is
+already available, it accepts all incoming connection without
+checking the client certificate.
 
 The [`test/setup-ca.sh`](/test/setup-ca.sh)
 script shows how to generate self-signed certificates. The test cluster is set
@@ -284,12 +228,6 @@ strength for their purposes and manage certificate distribution.
 A production deployment can improve upon that by using some other key
 delivery mechanism, like for example
 [Vault](https://www.vaultproject.io/).
-
-<!-- FILL TEMPLATE:
-* Target users and use cases
-* Design decisions & tradeoffs that were made
-* What is in scope and outside of scope
--->
 
 ## Volume Persistency
 
@@ -316,19 +254,10 @@ created for it on that node. When the application stops, the volume is
 deleted. The volume cannot be shared with other applications. Data on
 this volume is retained only while the application runs.
 
-* **Cache volumes**  
-Volumes are pre-created on a certain set of nodes, each with its own
-local data. Applications are started on those nodes and then get to
-use the volume on their node. Data persists across application
-restarts. This is useful when the data is only cached information that
-can be discarded and reconstructed at any time *and* the application
-can reuse existing local data when restarting.
-
 Volume | Kubernetes | PMEM-CSI | Limitations
 --- | --- | --- | ---
 Persistent | supported | supported | topology aware scheduling<sup>1</sup>
 Ephemeral | supported<sup>2</sup> | supported | resource constraints<sup>3</sup>
-Cache | supported | supported | topology aware scheduling<sup>1</sup>
 
 <sup>1 </sup>[Topology aware
 scheduling](https://github.com/kubernetes/enhancements/issues/490)
@@ -340,12 +269,16 @@ onto the right node(s).
 <sup>2 </sup> [CSI ephemeral volumes](https://kubernetes.io/docs/concepts/storage/volumes/#csi-ephemeral-volumes)
 feature support is alpha in Kubernetes v1.15, and beta in v1.16.
 
-<sup>3 </sup>The upstream design for ephemeral volumes currently does
-not take [resource
+<sup>3 </sup>The upstream design for CSI ephemeral volumes does not
+take [resource
 constraints](https://github.com/kubernetes/enhancements/pull/716#discussion_r250536632)
 into account. If an application gets scheduled onto a node and then
 creating the ephemeral volume on that node fails, the application on
-the node cannot start until resources become available.
+the node cannot start until resources become available. This will be
+solved with [generic ephemeral
+volumes](https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes)
+which are an alpha feature in Kubernetes 1.19 and supported by
+PMEM-CSI because they use the normal volume provisioning process.
 
 See [exposing persistent and cache volumes](install.md#expose-persistent-and-cache-volumes-to-applications) for configuration information.
 
@@ -355,30 +288,37 @@ PMEM-CSI implements the CSI `GetCapacity` call, but Kubernetes
 currently doesn't call that and schedules pods onto nodes without
 being aware of available storage capacity on the nodes. The effect is
 that pods using volumes with late binding may get tentatively assigned
-to a node and then get stuck because that decision is not reconsidered
-when the volume cannot be created there ([a
-bug](https://github.com/kubernetes/kubernetes/issues/72031)). Even if
-that decision is reconsidered, the same node may get selected again
-because Kubernetes does not get informed about the insufficient
-storage. Pods with ephemeral inline volumes always get stuck because
-the decision to use the node [is final](https://github.com/kubernetes-sigs/descheduler/issues/62).
+to a node and then may have to be rescheduled repeatedly until by
+chance they land on a node with enough capacity. Pods using multiple
+volumes with immediate binding may be unable to run permanently if
+those volumes were created on different nodes.
 
-Work is [under
-way](https://github.com/kubernetes/enhancements/pull/1353) to enhance
-scheduling in Kubernetes. In the meantime, PMEM-CSI provides two components
-that help with pod scheduling:
+[Storage capacity
+tracking](https://kubernetes.io/docs/concepts/storage/storage-capacity/)
+was added as alpha feature in Kubernetes 1.19 to enhance support for
+pod scheduling with late binding of volumes.
+
+Until that feature becomes generally available, PMEM-CSI provides two
+components that help with pod scheduling:
 
 ### Scheduler extender
 
-When a pod requests the special [extended
+When a pod requests a special [extended
 resource](https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#extended-resources)
-called `pmem-csi.intel.com/scheduler`, the Kubernetes scheduler calls
+, the Kubernetes scheduler calls
 a [scheduler
 extender](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/scheduling/scheduler_extender.md)
 provided by PMEM-CSI with a list of nodes that a pod might run
-on. This extender is implemented in the master controller and thus can
-connect to the controller on each of these nodes to check for
-capacity. PMEM-CSI then filters out all nodes which currently do not
+on.
+
+The name of that special resource is `<CSI driver name>/scheduler`,
+i.e. `pmem-csi.intel.com/scheduler` when the default PMEM-CSI driver
+name is used. It is possible to configure one extender per PMEM-CSI
+deployment because each deployment has its own unique driver name.
+
+This extender is implemented in the PMEM-CSI controller and retrieves
+metrics data from each PMEM-CSI node driver instance to filter out all
+nodes which currently do not
 have enough storage left for the volumes that still need to be
 created. This considers inline ephemeral volumes and all unbound
 volumes, regardless whether they use late binding or immediate
@@ -406,7 +346,7 @@ See our [implementation](http://github.com/intel/pmem-csi/tree/devel/pkg/schedul
 
 ### Pod admission webhook
 
-Having to add `pmem-csi.intel.com/scheduler` manually is not
+Having to add the `<CSI driver name>/scheduler` extended resource manually is not
 user-friendly. To simplify this, PMEM-CSI provides a [mutating
 admission
 webhook](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)
@@ -431,3 +371,16 @@ that don't use PMEM-CSI at all.
 Users must take care to create PVCs first, then the pods if they want
 to use the webhook. In practice, that is often already done because it
 is more natural, so it is not a big limitation.
+
+## PMEM-CSI Operator
+
+PMEM-CSI operator facilitates deploying and managing the [PMEM-CSI driver](https://github.com/intel/pmem-csi)
+on a Kubernetes cluster. This operator is based on the CoreOS [operator-sdk](https://github.com/operator-framework/operator-sdk)
+tools and APIs.
+
+The driver deployment is controlled by a cluster-scoped [custom resource](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/)
+named [`PmemCSIDeployment`](./install.md#pmem-csi-deployment-crd) in the
+`pmem-csi.intel.com/v1beta1` API group. The operator runs inside the cluster
+and listens for deployment changes. It makes sure that the required Kubernetes
+objects are created for a driver deployment. Refer to the PmemCSIDeployment
+CRD for details.

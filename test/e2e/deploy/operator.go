@@ -17,7 +17,7 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 
 	"github.com/intel/pmem-csi/pkg/apis"
-	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1alpha1"
+	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
 
 	"github.com/onsi/gomega"
 )
@@ -26,20 +26,20 @@ var (
 	DeploymentResource = schema.GroupVersionResource{
 		Group:    api.SchemeGroupVersion.Group,
 		Version:  api.SchemeGroupVersion.Version,
-		Resource: "deployments",
+		Resource: "pmemcsideployments",
 	}
 	Scheme = runtime.NewScheme()
 )
 
 func init() {
-	api.SchemeBuilder.Register(&api.Deployment{}, &api.DeploymentList{})
+	api.SchemeBuilder.Register(&api.PmemCSIDeployment{}, &api.PmemCSIDeploymentList{})
 	err := apis.AddToScheme(Scheme)
 	if err != nil {
 		panic(err)
 	}
 }
 
-func DeploymentToUnstructured(in *api.Deployment) *unstructured.Unstructured {
+func deploymentToUnstructured(in interface{}, gvk schema.GroupVersionKind) *unstructured.Unstructured {
 	if in == nil {
 		return nil
 	}
@@ -49,39 +49,52 @@ func DeploymentToUnstructured(in *api.Deployment) *unstructured.Unstructured {
 
 	// Ensure that type info is set. It's required when passing
 	// the unstructured object to a dynamic client.
-	out.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "pmem-csi.intel.com",
-		Version: "v1alpha1",
-		Kind:    "Deployment",
-	})
+	out.SetGroupVersionKind(gvk)
 	return &out
 }
 
-func DeploymentFromUnstructured(in *unstructured.Unstructured) *api.Deployment {
+func DeploymentToUnstructured(in *api.PmemCSIDeployment) *unstructured.Unstructured {
+	return deploymentToUnstructured(in, schema.GroupVersionKind{
+		Group:   api.SchemeGroupVersion.Group,
+		Version: api.SchemeGroupVersion.Version,
+		Kind:    "PmemCSIDeployment",
+	})
+}
+
+func deploymentFromUnstructured(in *unstructured.Unstructured, out interface{}) {
+	err := Scheme.Convert(in, out, nil)
+	framework.ExpectNoError(err, "convert from unstructured deployment")
+}
+
+func DeploymentFromUnstructured(in *unstructured.Unstructured) *api.PmemCSIDeployment {
 	if in == nil {
 		return nil
 	}
-	var out api.Deployment
-	err := Scheme.Convert(in, &out, nil)
-	framework.ExpectNoError(err, "convert from unstructured deployment")
+	var out api.PmemCSIDeployment
+	deploymentFromUnstructured(in, &out)
 	return &out
 }
 
-func CreateDeploymentCR(f *framework.Framework, dep api.Deployment) api.Deployment {
-	in := DeploymentToUnstructured(&dep)
+func createDeploymentCR(f *framework.Framework, dep *unstructured.Unstructured, res schema.GroupVersionResource) *unstructured.Unstructured {
 	var out *unstructured.Unstructured
 
 	gomega.Eventually(func() error {
 		var err error
-		out, err = f.DynamicClient.Resource(DeploymentResource).Create(context.Background(), in, metav1.CreateOptions{})
+		out, err = f.DynamicClient.Resource(res).Create(context.Background(), dep, metav1.CreateOptions{})
 		LogError(err, "create deployment error: %v, will retry...", err)
 		return err
-	}, "3m", "1s").Should(gomega.BeNil(), "create deployment %q", dep.Name)
-	framework.Logf("Created deployment %q", dep.Name)
+	}, "3m", "1s").Should(gomega.BeNil(), "create deployment %q", dep.GetName())
+	return out
+}
+
+func CreateDeploymentCR(f *framework.Framework, dep api.PmemCSIDeployment) api.PmemCSIDeployment {
+	in := DeploymentToUnstructured(&dep)
+	out := createDeploymentCR(f, in, DeploymentResource)
+	framework.Logf("Created deployment %q = (%+v)", dep.Name, out)
 	return *DeploymentFromUnstructured(out)
 }
 
-func EnsureDeploymentCR(f *framework.Framework, dep api.Deployment) api.Deployment {
+func EnsureDeploymentCR(f *framework.Framework, dep api.PmemCSIDeployment) api.PmemCSIDeployment {
 	var out *unstructured.Unstructured
 	gomega.Eventually(func() error {
 		existingDep, err := f.DynamicClient.Resource(DeploymentResource).Get(context.Background(), dep.Name, metav1.GetOptions{})
@@ -120,12 +133,16 @@ func DeleteDeploymentCR(f *framework.Framework, name string) {
 	framework.Logf("Deleted deployment %q", name)
 }
 
-func UpdateDeploymentCR(f *framework.Framework, dep api.Deployment) api.Deployment {
-	in := DeploymentToUnstructured(&dep)
+func UpdateDeploymentCR(f *framework.Framework, dep api.PmemCSIDeployment) api.PmemCSIDeployment {
 	var out *unstructured.Unstructured
 
 	gomega.Eventually(func() error {
 		var err error
+		in, err := f.DynamicClient.Resource(DeploymentResource).Get(context.Background(), dep.Name, metav1.GetOptions{})
+		d := DeploymentFromUnstructured(in)
+		d.Spec = dep.Spec
+		in = DeploymentToUnstructured(d)
+
 		out, err = f.DynamicClient.Resource(DeploymentResource).Update(context.Background(), in, metav1.UpdateOptions{})
 		LogError(err, "update deployment error: %v, will retry...", err)
 		return err
@@ -135,7 +152,7 @@ func UpdateDeploymentCR(f *framework.Framework, dep api.Deployment) api.Deployme
 	return *DeploymentFromUnstructured(out)
 }
 
-func GetDeploymentCR(f *framework.Framework, name string) api.Deployment {
+func GetDeploymentCR(f *framework.Framework, name string) api.PmemCSIDeployment {
 	var out *unstructured.Unstructured
 	gomega.Eventually(func() error {
 		var err error

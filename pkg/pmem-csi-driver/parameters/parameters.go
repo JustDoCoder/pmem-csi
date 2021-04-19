@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -19,13 +20,12 @@ type Origin int
 
 // Beware of API and backwards-compatibility breaking when changing these string constants!
 const (
-	CacheSize        = "cacheSize"
 	EraseAfter       = "eraseafter"
 	KataContainers   = "kataContainers"
 	Name             = "name"
 	PersistencyModel = "persistencyModel"
-	VolumeID         = "_id"
 	Size             = "size"
+	DeviceMode       = "deviceMode"
 
 	// Kubernetes v1.16+ adds this key to NodePublishRequest.VolumeContext
 	// while provisioning ephemeral volume.
@@ -37,8 +37,7 @@ const (
 	// Added by https://github.com/kubernetes-csi/external-provisioner/blob/feb67766f5e6af7db5c03ac0f0b16255f696c350/pkg/controller/controller.go#L584
 	ProvisionerID = "storage.kubernetes.io/csiProvisionerIdentity"
 
-	PersistencyNormal    Persistency = "normal" // In releases <= 0.6.x this was called "none", but not documented.
-	PersistencyCache     Persistency = "cache"
+	PersistencyNormal    Persistency = "normal"    // In releases <= 0.6.x this was called "none", but not documented.
 	PersistencyEphemeral Persistency = "ephemeral" // only used internally
 
 	//CreateVolumeOrigin is for parameters from the storage class in controller CreateVolume.
@@ -57,20 +56,9 @@ const (
 var valid = map[Origin][]string{
 	// Parameters from Kubernetes and users for a persistent volume.
 	CreateVolumeOrigin: []string{
-		CacheSize,
 		EraseAfter,
 		KataContainers,
 		PersistencyModel,
-	},
-
-	// These parameters are prepared by the master controller.
-	CreateVolumeInternalOrigin: []string{
-		CacheSize,
-		EraseAfter,
-		KataContainers,
-		PersistencyModel,
-
-		VolumeID,
 	},
 
 	// Parameters from Kubernetes and users.
@@ -87,7 +75,6 @@ var valid = map[Origin][]string{
 	// doesn't) and add the volume name for logging purposes.
 	// Kubernetes adds pod info and provisioner ID.
 	PersistentVolumeOrigin: []string{
-		CacheSize,
 		EraseAfter,
 		KataContainers,
 		PersistencyModel,
@@ -100,12 +87,12 @@ var valid = map[Origin][]string{
 	// Internally we store everything except the volume ID,
 	// which is handled separately.
 	NodeVolumeOrigin: []string{
-		CacheSize,
 		EraseAfter,
 		KataContainers,
 		Name,
 		PersistencyModel,
 		Size,
+		DeviceMode,
 	},
 }
 
@@ -114,13 +101,12 @@ var valid = map[Origin][]string{
 // The accessor functions always return a value, if unset
 // the default.
 type Volume struct {
-	CacheSize      *uint
 	EraseAfter     *bool
 	KataContainers *bool
 	Name           *string
 	Persistency    *Persistency
 	Size           *int64
-	VolumeID       *string
+	DeviceMode     *api.DeviceMode
 }
 
 // VolumeContext represents the same settings as a string map.
@@ -151,13 +137,10 @@ func Parse(origin Origin, stringmap map[string]string) (Volume, error) {
 		switch key {
 		case Name:
 			result.Name = &value
-		case VolumeID:
-			/* volume id provided by master controller (needed for cache volumes) */
-			result.VolumeID = &value
 		case PersistencyModel:
 			p := Persistency(value)
 			switch p {
-			case PersistencyNormal, PersistencyCache:
+			case PersistencyNormal:
 				result.Persistency = &p
 			case PersistencyEphemeral:
 				if origin != NodeVolumeOrigin {
@@ -171,13 +154,6 @@ func Parse(origin Origin, stringmap map[string]string) (Volume, error) {
 			default:
 				return result, fmt.Errorf("parameter %q: unknown value: %q", key, value)
 			}
-		case CacheSize:
-			c, err := strconv.ParseUint(value, 10, 32)
-			if err != nil {
-				return result, fmt.Errorf("parameter %q: failed to parse %q as uint: %v", key, value, err)
-			}
-			u := uint(c)
-			result.CacheSize = &u
 		case KataContainers:
 			b, err := strconv.ParseBool(value)
 			if err != nil {
@@ -206,6 +182,12 @@ func Parse(origin Origin, stringmap map[string]string) (Volume, error) {
 				p := PersistencyEphemeral
 				result.Persistency = &p
 			}
+		case DeviceMode:
+			var mode api.DeviceMode
+			if err := mode.Set(value); err != nil {
+				return result, fmt.Errorf("parameter %q: failed to parse %q as DeviceMode: %v", key, value, err)
+			}
+			result.DeviceMode = &mode
 		case ProvisionerID:
 		default:
 			if !strings.HasPrefix(key, PodInfoPrefix) {
@@ -215,9 +197,6 @@ func Parse(origin Origin, stringmap map[string]string) (Volume, error) {
 	}
 
 	// Some sanity checks.
-	if result.CacheSize != nil && result.GetPersistency() != PersistencyCache {
-		return result, fmt.Errorf("parameter %q: invalid for %q = %q", CacheSize, PersistencyModel, result.GetPersistency())
-	}
 	if origin == EphemeralVolumeOrigin && result.Size == nil {
 		return result, fmt.Errorf("required parameter %q not specified", Size)
 	}
@@ -238,9 +217,6 @@ func (v Volume) ToContext() VolumeContext {
 	// Intentionally not stored:
 	// - volumeID
 
-	if v.CacheSize != nil {
-		result[CacheSize] = fmt.Sprintf("%d", *v.CacheSize)
-	}
 	if v.EraseAfter != nil {
 		result[EraseAfter] = fmt.Sprintf("%v", *v.EraseAfter)
 	}
@@ -256,15 +232,11 @@ func (v Volume) ToContext() VolumeContext {
 	if v.KataContainers != nil {
 		result[KataContainers] = fmt.Sprintf("%v", *v.KataContainers)
 	}
+	if v.DeviceMode != nil {
+		result[DeviceMode] = string(*v.DeviceMode)
+	}
 
 	return result
-}
-
-func (v Volume) GetCacheSize() uint {
-	if v.CacheSize != nil {
-		return *v.CacheSize
-	}
-	return 1
 }
 
 func (v Volume) GetEraseAfter() bool {
@@ -302,9 +274,10 @@ func (v Volume) GetKataContainers() bool {
 	return false
 }
 
-func (v Volume) GetVolumeID() string {
-	if v.VolumeID != nil {
-		return *v.VolumeID
+func (v Volume) GetDeviceMode() api.DeviceMode {
+	if v.DeviceMode != nil {
+		return *v.DeviceMode
 	}
+
 	return ""
 }

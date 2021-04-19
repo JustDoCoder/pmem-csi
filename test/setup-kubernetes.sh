@@ -61,8 +61,9 @@ networking:
   podSubnet: \"10.244.0.0/16\""
 	;;
     fedora)
-	# Use weave on Fedora. Nothing to add to kubeconfig.
-	podnetworkingurl=https://cloud.weave.works/k8s/net?k8s-version=$k8sversion
+	# Use Calico on Fedora as it is the only CNI plugin that is tested by kubeadm.
+	# https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/#pod-network
+	podnetworkingurl=https://docs.projectcalico.org/manifests/calico.yaml
 	;;
     *)
 	echo "ERROR: unsupported distro=$distro"
@@ -82,11 +83,21 @@ list_gates () (
 # filter, the extender is only going to be called for pods which
 # explicitly enable it and thus other pods (including PMEM-CSI
 # itself!)  can be scheduled without it.
+#
+# In order to reach the scheduler extender, a fixed node port
+# is used regardless of the driver name, so only one deployment
+# can be active at once. In production this has to be solved
+# differently.
+#
+# Usually the driver name will be "pmem-csi.intel.com", but for testing
+# purposed we also configure a second extender.
 sudo mkdir -p /var/lib/scheduler/
 sudo cp ca.crt /var/lib/scheduler/
 
-# https://github.com/kubernetes/kubernetes/blob/52d7614a8ca5b8aebc45333b6dc8fbf86a5e7ddf/staging/src/k8s.io/kube-scheduler/config/v1alpha1/types.go#L38-L107
-sudo sh -c 'cat >/var/lib/scheduler/scheduler-config.yaml' <<EOF
+case "$k8sversion" in
+    v1.1[5678]*)
+        # https://github.com/kubernetes/kubernetes/blob/52d7614a8ca5b8aebc45333b6dc8fbf86a5e7ddf/staging/src/k8s.io/kube-scheduler/config/v1alpha1/types.go#L38-L107
+        sudo sh -c 'cat >/var/lib/scheduler/scheduler-config.yaml' <<EOF
 apiVersion: kubescheduler.config.k8s.io/v1alpha1
 kind: KubeSchedulerConfiguration
 schedulerName: default-scheduler
@@ -99,8 +110,8 @@ clientConnection:
   kubeconfig: /etc/kubernetes/scheduler.conf
 EOF
 
-# https://github.com/kubernetes/kubernetes/blob/52d7614a8ca5b8aebc45333b6dc8fbf86a5e7ddf/staging/src/k8s.io/kube-scheduler/config/v1/types.go#L28-L47
-sudo sh -c 'cat >/var/lib/scheduler/scheduler-policy.cfg' <<EOF
+        # https://github.com/kubernetes/kubernetes/blob/52d7614a8ca5b8aebc45333b6dc8fbf86a5e7ddf/staging/src/k8s.io/kube-scheduler/config/v1/types.go#L28-L47
+        sudo sh -c 'cat >/var/lib/scheduler/scheduler-policy.cfg' <<EOF
 {
   "kind" : "Policy",
   "apiVersion" : "v1",
@@ -109,16 +120,65 @@ sudo sh -c 'cat >/var/lib/scheduler/scheduler-policy.cfg' <<EOF
       "urlPrefix": "https://127.0.0.1:${TEST_SCHEDULER_EXTENDER_NODE_PORT}",
       "filterVerb": "filter",
       "prioritizeVerb": "prioritize",
-      "nodeCacheCapable": false,
+      "nodeCacheCapable": true,
       "weight": 1,
       "managedResources":
       [{
         "name": "pmem-csi.intel.com/scheduler",
         "ignoredByScheduler": true
       }]
+    },
+    {
+      "urlPrefix": "https://127.0.0.1:${TEST_SCHEDULER_EXTENDER_NODE_PORT}",
+      "filterVerb": "filter",
+      "prioritizeVerb": "prioritize",
+      "nodeCacheCapable": true,
+      "weight": 1,
+      "managedResources":
+      [{
+        "name": "second.pmem-csi.intel.com/scheduler",
+        "ignoredByScheduler": true
+      }]
     }]
 }
 EOF
+        ;;
+    *)
+        # https://github.com/kubernetes/kubernetes/blob/1afc53514032a44d091ae4a9f6e092171db9fe10/staging/src/k8s.io/kube-scheduler/config/v1beta1/types.go#L44-L96
+        sudo sh -c 'cat >/var/lib/scheduler/scheduler-config.yaml' <<EOF
+apiVersion: kubescheduler.config.k8s.io/v1beta1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  # This is where kubeadm puts it.
+  kubeconfig: /etc/kubernetes/scheduler.conf
+extenders:
+- urlPrefix: https://127.0.0.1:${TEST_SCHEDULER_EXTENDER_NODE_PORT}
+  filterVerb: filter
+  prioritizeVerb: prioritize
+  nodeCacheCapable: true
+  weight: 1
+  managedResources:
+  - name: pmem-csi.intel.com/scheduler
+    ignoredByScheduler: true
+- urlPrefix: https://127.0.0.1:${TEST_SCHEDULER_EXTENDER_NODE_PORT}
+  filterVerb: filter
+  prioritizeVerb: prioritize
+  nodeCacheCapable: true
+  weight: 1
+  managedResources:
+  - name: second.pmem-csi.intel.com/scheduler
+    ignoredByScheduler: true
+EOF
+        ;;
+esac
+
+
+# We always use systemd. Auto-detected for Docker, but not for other
+# CRIs
+# (https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/#configure-cgroup-driver-used-by-kubelet-on-control-plane-node).
+kubeadm_config_kubelet="$kubeadm_config_kubelet
+cgroupDriver: systemd
+"
 
 kubeadm_config_kubelet="$kubeadm_config_kubelet
 featureGates:
@@ -130,9 +190,13 @@ kubeadm_config_cluster="$kubeadm_config_cluster
 apiServer:
   extraArgs:
     feature-gates: ${TEST_FEATURE_GATES}
+    $(case "$k8sversion" in v1.1[5678]*) : ;; *) echo "runtime-config: storage.k8s.io/v1alpha1";; esac)
 controllerManager:
   extraArgs:
     feature-gates: ${TEST_FEATURE_GATES}
+    # Let the kube-controller-manager run as fast as it can.
+    kube-api-burst: \"100000\"
+    kube-api-qps: \"100000\"
 scheduler:
   extraVolumes:
     - name: config
@@ -155,7 +219,7 @@ scheduler:
       readOnly: true
   extraArgs:
     feature-gates: ${TEST_FEATURE_GATES}
-    config: /var/lib/scheduler/scheduler-config.yaml
+    $(if [ -e /var/lib/scheduler/scheduler-config.yaml ]; then echo 'config: /var/lib/scheduler/scheduler-config.yaml'; fi)
 "
 
 if [ -e /dev/vdc ]; then

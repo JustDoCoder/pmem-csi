@@ -74,9 +74,9 @@ RUNTIME_DEPS += sed -e 's;^sigs.k8s.io/\([^/]*\).*;sigs.k8s.io/\1;' |
 # - everything from gRPC is one project
 RUNTIME_DEPS += sed -e 's;google.golang.org/grpc/*.*;grpc-go,https://github.com/grpc/grpc-go;' |
 # - Kubernetes is split across several repos.
-RUNTIME_DEPS += sed -e 's;^k8s.io/.*\|github.com/kubernetes-csi/.*;kubernetes,https://github.com/kubernetes/kubernetes,9641;' | \
+RUNTIME_DEPS += sed -e 's;^k8s.io/.*\|github.com/kubernetes-csi/.*;kubernetes,https://github.com/kubernetes/kubernetes,12141;' | \
 # - additional Golang repos
-RUNTIME_DEPS += sed -e 's;\(golang.org/x/.*\);Go,https://github.com/golang/go,9051;' | \
+RUNTIME_DEPS += sed -e 's;\(golang.org/x/.*\);Go,https://golang.org/,11382;' | \
 # - various other projects (sorted alphabetically)
 RUNTIME_DEPS += sed \
 	-e 's;\(github.com/PuerkitoBio/purell\);purell,https://\1;' \
@@ -118,8 +118,7 @@ RUNTIME_DEPS += sed \
 	-e 's;gopkg.in/fsnotify.*;golang-github-fsnotify-fsnotify,https://github.com/fsnotify/fsnotify;' \
 	-e 's;gopkg.in/inf\.v.*;go-inf,https://github.com/go-inf/inf;' \
 	-e 's;gopkg.in/yaml\.v.*;go-yaml,https://https://github.com/go-yaml/yaml,9476;' \
-	-e 's;sigs.k8s.io/controller-runtime;kubernetes-sigs/controller-runtime,https://github.com/kubernetes-sigs/controller-runtime;' \
-	-e 's;sigs.k8s.io/yaml;kubernetes-sigs/yaml,https://github.com/kubernetes-sigs/yaml;' \
+	-e 's;sigs.k8s.io/\(.*\);kubernetes-sigs/\1,https://github.com/kubernetes-sigs/\1;' \
 	| cat |
 # - ensure that we have three columns
 RUNTIME_DEPS += sed -e 's;^\([^,]*\),\([^,]*\)$$;\1,\2,;' |
@@ -134,9 +133,9 @@ RUNTIME_DEPS += LC_ALL=C LANG=C sort -u
 # (https://github.com/intel/pmem-csi/pull/420#discussion_r346850741).
 .PHONY: run_tests
 test: run_tests
-RUN_TESTS = TEST_WORK=$(abspath _work) \
-	$(TEST_CMD) -timeout 0 $(filter-out %/pmem-device-manager,$(TEST_PKGS))
-RUN_TEST_DEPS = _work/pmem-ca/.ca-stamp _work/evil-ca/.ca-stamp check-go-version-$(GO_BINARY)
+RUN_TESTS = TEST_WORK=$(abspath _work) REPO_ROOT=`pwd` \
+	env GODEBUG=x509ignoreCN=0 $(TEST_CMD) -timeout 0 $(filter-out %/pmem-device-manager %/imagefile/test,$(TEST_PKGS))
+RUN_TEST_DEPS = check-go-version-$(GO_BINARY)
 
 run_tests: $(RUN_TEST_DEPS)
 	$(RUN_TESTS)
@@ -153,27 +152,9 @@ TEST_E2E_SKIP_ALL += should.access.volume.from.different.nodes
 # Test is flawed and will become optional soon (probably csi-test 3.2.0): https://github.com/kubernetes-csi/csi-test/pull/258
 TEST_E2E_SKIP_ALL += NodeUnpublishVolume.*should.fail.when.the.volume.is.missing
 
-# This is a test for behavior of kubelet which Kubernetes <= 1.15 doesn't pass.
-TEST_E2E_SKIP_1.14 += volumeMode.should.not.mount.*map.unused.volumes.in.a.pod
-TEST_E2E_SKIP_1.15 += volumeMode.should.not.mount.*map.unused.volumes.in.a.pod
-
-# It looks like Kubernetes <= 1.15 does not wait for
-# NodeUnpublishVolume to complete before deleting the pod:
-#
-# Apr 21 17:33:12.743: INFO: Wait up to 5m0s for pod "dax-volume-test" to be fully deleted
-# pmem-csi-node-4dsmr/pmem-driver@pmem..ker2: I0421 17:33:34.491659       1 tracing.go:19] GRPC call: /csi.v1.Node/NodeGetCapabilities
-# pmem-csi-node-4dsmr/pmem-driver@pmem..ker2: I0421 17:33:45.549013       1 tracing.go:19] GRPC call: /csi.v1.Node/NodeUnpublishVolume
-# pmem-csi-node-4dsmr/pmem-driver@pmem..ker2: I0421 17:33:45.549189       1 nodeserver.go:295] NodeUnpublishVolume: unmount /var/lib/kubelet/pods/1c5f1fec-b08b-4264-8c55-40a22c1b3d16/volumes/kubernetes.io~csi/vol1/mount
-# STEP: delete the pod
-# Apr 21 17:33:46.769: INFO: Waiting for pod dax-volume-test to disappear
-# Apr 21 17:33:46.775: INFO: Pod dax-volume-test no longer exists
-#
-# That breaks our volume leak detection because the test continues
-# before the volume is truly removed. As a workaround, we disable
-# ephemeral volume tests on Kubernetes <= 1.15. That's okay because the feature
-# was alpha in those releases and shouldn't be used.
-TEST_E2E_SKIP_1.14 += Testpattern:.Ephemeral-volume Testpattern:.inline.ephemeral.CSI.volume
-TEST_E2E_SKIP_1.15 += Testpattern:.Ephemeral-volume Testpattern:.inline.ephemeral.CSI.volume
+# Do not run driver stress tests in direct mode, they are consuming more time(~17m per test)
+# The reason is shredding the ndctl device is consuming most of the time.
+TEST_E2E_SKIP_ALL += direct.*binding.stress.test
 
 # Add all Kubernetes version-specific suppressions.
 TEST_E2E_SKIP_ALL += $(TEST_E2E_SKIP_$(shell cat _work/$(CLUSTER)/kubernetes.version))
@@ -210,14 +191,15 @@ RUN_E2E = KUBECONFIG=`pwd`/_work/$(CLUSTER)/kube.config \
 	) \
 	TEST_CMD='$(TEST_CMD)' \
 	GO='$(GO)' \
-	TEST_PKGS='$(shell for i in $(TEST_PKGS); do if ls $$i/*_test.go 2>/dev/null >&2; then echo $$i; fi; done)' \
-	$(GO) test -count=1 -timeout 0 -v ./test/e2e \
+	TEST_PKGS='$(shell for i in ./pkg/pmem-device-manager ./pkg/imagefile/test; do if ls $$i/*_test.go 2>/dev/null >&2; then echo $$i; fi; done)' \
+	$(GO) test -count=1 -timeout 0 -v ./test/e2e -args \
+                -v=5 \
                 -ginkgo.skip='$(subst $(space),|,$(strip $(subst @,$(space),$(TEST_E2E_SKIP_ALL))))' \
                 -ginkgo.focus='$(subst $(space),|,$(strip $(subst @,$(space),$(TEST_E2E_FOCUS))))' \
 		-ginkgo.randomizeAllSpecs=false \
 	        $(TEST_E2E_ARGS) \
                 -report-dir=$(TEST_E2E_REPORT_DIR)
-test_e2e: start $(RUN_TEST_DEPS)
+test_e2e: start $(RUN_TEST_DEPS) operator-generate-catalog
 	$(RUN_E2E)
 
 run_dm_tests: TEST_BINARY_NAME=pmem-dm-tests
@@ -233,13 +215,16 @@ run_dm_tests: _work/bin/govm start_test_vm
 
 _work/%/.ca-stamp: test/setup-ca.sh _work/.setupcfssl-stamp
 	rm -rf $(@D)
-	WORKDIR='$(@D)' PATH='$(PWD)/_work/bin/:$(PATH)' CA='$*' EXTRA_CNS="wrong-node-controller" $<
+	WORKDIR='$(@D)' PATH='$(PWD)/_work/bin/:$(PATH)' NS=default $<
 	touch $@
 
+
+_work/.setupcfssl-stamp: CFSSL_VERSION=1.5.0
 _work/.setupcfssl-stamp:
 	rm -rf _work/bin
-	curl -L https://pkg.cfssl.org/R1.2/cfssl_linux-amd64 -o _work/bin/cfssl --create-dirs
-	curl -L https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64 -o _work/bin/cfssljson --create-dirs
+	curl -L https://github.com/cloudflare/cfssl/releases/download/v$(CFSSL_VERSION)/cfssl_$(CFSSL_VERSION)_linux_amd64 -o _work/bin/cfssl --create-dirs
+	curl -L https://github.com/cloudflare/cfssl/releases/download/v$(CFSSL_VERSION)/cfssljson_$(CFSSL_VERSION)_linux_amd64 -o _work/bin/cfssljson --create-dirs
+
 	chmod a+x _work/bin/cfssl _work/bin/cfssljson
 	touch $@
 

@@ -7,18 +7,23 @@ SPDX-License-Identifier: Apache-2.0
 package pmemcsidriver
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"sync"
 
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
+	pmemerr "github.com/intel/pmem-csi/pkg/errors"
 	grpcserver "github.com/intel/pmem-csi/pkg/grpc-server"
 	"github.com/intel/pmem-csi/pkg/pmem-csi-driver/parameters"
 	pmdmanager "github.com/intel/pmem-csi/pkg/pmem-device-manager"
@@ -42,7 +47,7 @@ type nodeControllerServer struct {
 }
 
 var _ csi.ControllerServer = &nodeControllerServer{}
-var _ grpcserver.PmemService = &nodeControllerServer{}
+var _ grpcserver.Service = &nodeControllerServer{}
 
 var nodeVolumeMutex = keymutex.NewHashed(-1)
 
@@ -75,21 +80,44 @@ func NewNodeControllerServer(nodeID string, dm pmdmanager.PmemDeviceManager, sm 
 		}
 
 		for _, id := range ids {
+			// retrieve volume info
+			vol := &nodeVolume{}
+			if err := sm.Get(id, vol); err != nil {
+				klog.Warningf("Failed to retrieve volume info for id %q from state: %v", id, err)
+				continue
+			}
+			v, err := parameters.Parse(parameters.NodeVolumeOrigin, vol.Params)
+			if err != nil {
+				klog.Warningf("Failed to parse volume parameters for volume %q: %v", id, err)
+				continue
+			}
+
 			found := false
-			// See if the device data stored at StateManager is still valid
-			for _, devInfo := range devices {
-				if devInfo.VolumeId == id {
+			if v.GetDeviceMode() != dm.GetMode() {
+				dm, err := pmdmanager.New(v.GetDeviceMode(), 0)
+				if err != nil {
+					klog.Warningf("Failed to initialize device manager for state volume '%s'(volume mode: '%s'): %v", id, v.GetDeviceMode(), err)
+					continue
+				}
+
+				if _, err := dm.GetDevice(id); err == nil {
 					found = true
-					break
+				} else if !errors.Is(err, pmemerr.DeviceNotFound) {
+					klog.Warningf("Failed to fetch device for state volume '%s'(volume mode: '%s'): %v", id, v.GetDeviceMode(), err)
+					// Let's ignore this volume
+					continue
+				}
+			} else {
+				// See if the device data stored at StateManager is still valid
+				for _, devInfo := range devices {
+					if devInfo.VolumeId == id {
+						found = true
+						break
+					}
 				}
 			}
 
 			if found {
-				// retrieve volume info
-				vol := &nodeVolume{}
-				if err := sm.Get(id, vol); err != nil {
-					klog.Warningf("Failed to retrieve volume info for id %q from state: %v", id, err)
-				}
 				ncs.pmemVolumes[id] = vol
 			} else {
 				// if not found in DeviceManager's list, add to cleanupList
@@ -150,7 +178,7 @@ func (cs *nodeControllerServer) CreateVolume(ctx context.Context, req *csi.Creat
 
 	topology = append(topology, &csi.Topology{
 		Segments: map[string]string{
-			PmemDriverTopologyKey: cs.nodeID,
+			DriverTopologyKey: cs.nodeID,
 		},
 	})
 
@@ -191,20 +219,21 @@ func (cs *nodeControllerServer) createVolumeInternal(ctx context.Context,
 	}
 
 	klog.V(4).Infof("Node CreateVolume: Name:%q req.Required:%v req.Limit:%v", volumeName, asked, capacity.GetLimitBytes())
-	volumeID = p.GetVolumeID()
-	if volumeID == "" {
-		volumeID = GenerateVolumeID("Node CreateVolume", volumeName)
-		// Check do we have entry with newly generated VolumeID already
-		if vol := cs.getVolumeByID(volumeID); vol != nil {
-			// if we have, that has to be VolumeID collision, because above we checked
-			// that we don't have entry with such Name. VolumeID collision is very-very
-			// unlikely so we should not get here in any near future, if otherwise state is good.
-			klog.V(3).Infof("Controller CreateVolume: VolumeID:%s collision: existing name:%s new name:%s",
-				volumeID, vol.Params[parameters.Name], volumeName)
-			statusErr = status.Error(codes.Internal, "VolumeID/hash collision, can not create unique Volume")
-			return
-		}
+	volumeID = generateVolumeID("Node CreateVolume", volumeName)
+	// Check do we have entry with newly generated VolumeID already
+	if vol := cs.getVolumeByID(volumeID); vol != nil {
+		// if we have, that has to be VolumeID collision, because above we checked
+		// that we don't have entry with such Name. VolumeID collision is very-very
+		// unlikely so we should not get here in any near future, if otherwise state is good.
+		klog.V(3).Infof("Controller CreateVolume: VolumeID:%s collision: existing name:%s new name:%s",
+			volumeID, vol.Params[parameters.Name], volumeName)
+		statusErr = status.Error(codes.Internal, "VolumeID/hash collision, cannot create unique Volume")
+		return
 	}
+
+	// Set which device manager was used to create the volume
+	mode := cs.dm.GetMode()
+	p.DeviceMode = &mode
 
 	vol := &nodeVolume{
 		ID:     volumeID,
@@ -236,7 +265,11 @@ func (cs *nodeControllerServer) createVolumeInternal(ctx context.Context,
 		asked = 1
 	}
 	if err := cs.dm.CreateDevice(volumeID, uint64(asked)); err != nil {
-		statusErr = status.Errorf(codes.Internal, "Node CreateVolume: device creation failed: %v", err)
+		code := codes.Internal
+		if errors.Is(err, pmemerr.NotEnoughSpace) {
+			code = codes.ResourceExhausted
+		}
+		statusErr = status.Errorf(code, "Node CreateVolume: device creation failed: %v", err)
 		return
 	}
 	// TODO(?): determine and return actual size here?
@@ -280,8 +313,16 @@ func (cs *nodeControllerServer) DeleteVolume(ctx context.Context, req *csi.Delet
 		return nil, status.Errorf(codes.Internal, "previously stored volume parameters for volume with ID %q: %v", req.VolumeId, err)
 	}
 
-	if err := cs.dm.DeleteDevice(req.VolumeId, p.GetEraseAfter()); err != nil {
-		if errors.Is(err, pmdmanager.ErrDeviceInUse) {
+	dm := cs.dm
+	if dm.GetMode() != p.GetDeviceMode() {
+		dm, err = pmdmanager.New(p.GetDeviceMode(), 0)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to initialize device manager for volume(ID %q, mode: %s): %v", req.VolumeId, p.GetDeviceMode(), err)
+		}
+	}
+
+	if err := dm.DeleteDevice(req.VolumeId, p.GetEraseAfter()); err != nil {
+		if errors.Is(err, pmemerr.DeviceInUse) {
 			return nil, status.Errorf(codes.FailedPrecondition, err.Error())
 		}
 		return nil, status.Errorf(codes.Internal, "Failed to delete volume: %s", err.Error())
@@ -336,37 +377,92 @@ func (cs *nodeControllerServer) ListVolumes(ctx context.Context, req *csi.ListVo
 		klog.Errorf("invalid list volumes req: %v", req)
 		return nil, err
 	}
+
 	cs.mutex.Lock()
 	defer cs.mutex.Unlock()
-	// List namespaces
-	var entries []*csi.ListVolumesResponse_Entry
+
+	// Copy from map into array for pagination.
+	vols := make([]*nodeVolume, 0, len(cs.pmemVolumes))
 	for _, vol := range cs.pmemVolumes {
-		entries = append(entries, &csi.ListVolumesResponse_Entry{
+		vols = append(vols, vol)
+	}
+
+	// Code originally copied from https://github.com/kubernetes-csi/csi-test/blob/f14e3d32125274e0c3a3a5df380e1f89ff7c132b/mock/service/controller.go#L309-L365
+
+	var (
+		ulenVols      = int32(len(vols))
+		maxEntries    = req.MaxEntries
+		startingToken int32
+	)
+
+	if v := req.StartingToken; v != "" {
+		i, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return nil, status.Errorf(
+				codes.Aborted,
+				"startingToken=%d !< int32=%d",
+				startingToken, math.MaxUint32)
+		}
+		startingToken = int32(i)
+	}
+
+	if startingToken > ulenVols {
+		return nil, status.Errorf(
+			codes.Aborted,
+			"startingToken=%d > len(vols)=%d",
+			startingToken, ulenVols)
+	}
+
+	// Discern the number of remaining entries.
+	rem := ulenVols - startingToken
+
+	// If maxEntries is 0 or greater than the number of remaining entries then
+	// set maxEntries to the number of remaining entries.
+	if maxEntries == 0 || maxEntries > rem {
+		maxEntries = rem
+	}
+
+	var (
+		i       int
+		j       = startingToken
+		entries = make(
+			[]*csi.ListVolumesResponse_Entry,
+			maxEntries)
+	)
+
+	for i = 0; i < len(entries); i++ {
+		vol := vols[j]
+		entries[i] = &csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
 				VolumeId:      vol.ID,
 				CapacityBytes: vol.Size,
-				VolumeContext: vol.Params,
 			},
-		})
+		}
+		j++
+	}
+
+	var nextToken string
+	if n := startingToken + int32(i); n < ulenVols {
+		nextToken = fmt.Sprintf("%d", n)
 	}
 
 	return &csi.ListVolumesResponse{
-		Entries: entries,
+		Entries:   entries,
+		NextToken: nextToken,
 	}, nil
 }
 
 func (cs *nodeControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
-	var capacity int64
-
 	cap, err := cs.dm.GetCapacity()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 
-	capacity = int64(cap)
-
 	return &csi.GetCapacityResponse{
-		AvailableCapacity: capacity,
+		// Maximum volume size works better for capacity-aware
+		// pod scheduling than the available size. The other
+		// capacity values are available as metric.
+		AvailableCapacity: int64(cap.MaxVolumeSize),
 	}, nil
 }
 
@@ -392,4 +488,34 @@ func (cs *nodeControllerServer) getVolumeByName(volumeName string) *nodeVolume {
 
 func (cs *nodeControllerServer) ControllerExpandVolume(context.Context, *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
+}
+
+func (cs *nodeControllerServer) ControllerGetVolume(context.Context, *csi.ControllerGetVolumeRequest) (*csi.ControllerGetVolumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "")
+}
+
+func generateVolumeID(caller string, name string) string {
+	// VolumeID is hashed from Volume Name.
+	// Hashing guarantees same ID for repeated requests.
+	// Why do we generate new VolumeID via hashing?
+	// We can not use Name directly as VolumeID because of at least 2 reasons:
+	// 1. allowed max. Name length by CSI spec is 128 chars, which does not fit
+	// into LVM volume name (for that we use VolumeID), where groupname+volumename
+	// must fit into 126 chars.
+	// Ndctl namespace name is even shorter, it can be 63 chars long.
+	// 2. CSI spec. allows characters in Name that are not allowed in LVM names.
+	hasher := sha256.New224()
+	hasher.Write([]byte(name))
+	hash := hex.EncodeToString(hasher.Sum(nil))
+	// Use first characters of Name in VolumeID to help humans.
+	// This also lowers collision probability even more, as an attacker
+	// attempting to cause VolumeID collision, has to find another Name
+	// producing same sha-224 hash, while also having common first N chars.
+	use := 6
+	if len(name) < 6 {
+		use = len(name)
+	}
+	id := name[0:use] + "-" + hash
+	klog.V(4).Infof("%s: Create VolumeID:%s based on name:%s", caller, id, name)
+	return id
 }

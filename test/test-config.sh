@@ -15,7 +15,7 @@ if [ -d test/test-config.d ]; then
 fi
 
 # The operating system to install inside the nodes.
-: ${TEST_DISTRO:=clear}
+: ${TEST_DISTRO:=fedora}
 
 # Choose the version of the operating system that gets installed. Valid
 # values depend on the OS.
@@ -27,7 +27,7 @@ fi
 #
 # cri-o is the default on Clear Linux because that is supported better
 # and Docker elsewhere because we can install it easily.
-: ${TEST_CRI:=$(case ${TEST_DISTRO} in clear) echo crio;; *) echo docker;; esac)}
+: ${TEST_CRI:=$(case ${TEST_DISTRO} in clear) echo crio;; *) echo containerd;; esac)}
 
 # A local registry running on the build host, aka localhost:5000.
 # In order to reach it from inside the virtual cluster, we need
@@ -101,20 +101,31 @@ fi
 # Allowed values: IfNotPresent, Always, Never
 : ${TEST_IMAGE_PULL_POLICY:=IfNotPresent}
 
+# Namespace used to deploy the PMEM-CSI driver
+: ${TEST_DRIVER_NAMESPACE:=pmem-csi}
+
+# Common prefix for deployed PMEM-CSI objects. The operator
+# and the YAML files use the CSI driver name with dots replaced
+# by hyphens, i.e. "pmem-csi-intel-com" for the default
+# pmem-csi.intel.com.
+: ${TEST_DRIVER_PREFIX:=pmem-csi-intel-com}
+
 # Namespace used by test/start-operator.sh for the operator
 # itself.
-: ${TEST_OPERATOR_NAMESPACE:=default}
+: ${TEST_OPERATOR_NAMESPACE:=pmem-csi}
+
+# Log verbosity level used for operator deployed by
+# ./test/start-operator.sh script.
+: ${TEST_OPERATOR_LOGLEVEL:=5}
 
 # A value for the pmem-csi.intel.com/deployment label that is
 # set for all objects created by test/start-operator.sh.
-: ${TEST_OPERATOR_DEPLOYMENT:=operator}
+: ${TEST_OPERATOR_DEPLOYMENT_LABEL:=operator}
 
-# TLS certificates installed by test/setup-deployment.sh.
-: ${TEST_CA:=_work/pmem-ca/ca.pem}
-: ${TEST_REGISTRY_CERT:=_work/pmem-ca/pmem-registry.pem}
-: ${TEST_REGISTRY_KEY:=_work/pmem-ca/pmem-registry-key.pem}
-: ${TEST_NODE_CERT:=_work/pmem-ca/pmem-node-controller.pem}
-: ${TEST_NODE_KEY:=_work/pmem-ca/pmem-node-controller-key.pem}
+# Root CA created and/or used by test/setup-deployment.sh
+# and test/setup-ca-kubernetes.sh. ca.pem is the public
+# and ca-key.pem is the private key.
+: ${TEST_CA:=$(pwd)/_work/pmem-ca/ca}
 
 # Initialize "region0" as required by PMEM-CSI.
 : ${TEST_INIT_REGION:=true}
@@ -139,12 +150,27 @@ fi
 # is installed instead of the latest one. Ignored when
 # using Clear Linux as OS because with Clear Linux we have
 # to use the Kubernetes version that ships with it.
-: ${TEST_KUBERNETES_VERSION:=1.18}
+: ${TEST_KUBERNETES_VERSION:=1.20}
+
+# Can be used to pick one of potentially severally of the
+# pre-generated deploy/kubernetes-<version><flavor> deployment
+# variants for a certain Kubernetes release. Either empty or must
+# match the directory suffix, i.e. start with a hyphen.
+: ${TEST_KUBERNETES_FLAVOR:=}
+
+# The label and its value that identifies the nodes with PMEM.
+# The default is the label set by NFD.
+: ${TEST_PMEM_NODE_LABEL:=feature.node.kubernetes.io/memory-nv.dax=true}
 
 # Kubernetes feature gates to enable/disable.
-# EndpointSlice is disabled because of https://github.com/kubernetes/kubernetes/issues/91287
-: ${TEST_FEATURE_GATES:=CSINodeInfo=true,CSIDriverRegistry=true,CSIBlockVolume=true,CSIInlineVolume=true\
-$(case ${TEST_KUBERNETES_VERSION} in 1.1[0-5]) ;; *) echo ',EndpointSlice=false';; esac)}
+# EndpointSlice is disabled because of https://github.com/kubernetes/kubernetes/issues/91287 (Kubernetes
+# < 1.19) and because there were random connection failures to node ports during sanity
+# testing (Kubernetes 1.19.0)
+: ${TEST_FEATURE_GATES:=\
+$(case ${TEST_KUBERNETES_VERSION} in 1.1[6-9]) echo 'EndpointSlice=false,';; esac)\
+$(case ${TEST_KUBERNETES_VERSION} in 1.1[8-9]) echo 'EndpointSliceProxying=false,';; esac)\
+$(case ${TEST_KUBERNETES_VERSION} in 1.19 | 1.20) echo 'CSIStorageCapacity=true,GenericEphemeralVolume=true,';; esac)\
+}
 
 # If non-empty, the version of Kata Containers which is to be installed
 # in the Kubernetes cluster. Installation is done with
@@ -156,5 +182,5 @@ $(case ${TEST_KUBERNETES_VERSION} in 1.1[0-5]) ;; *) echo ',EndpointSlice=false'
 # Kubernetes node port number
 # (https://kubernetes.io/docs/concepts/services-networking/service/#nodeport)
 # that is going to be used by kube-scheduler to reach the scheduler
-# extender service (see deploy/scheduler/scheduler-service.yaml).
+# extender service (see test/setup-kubernetes.sh)
 : ${TEST_SCHEDULER_EXTENDER_NODE_PORT:=32000}

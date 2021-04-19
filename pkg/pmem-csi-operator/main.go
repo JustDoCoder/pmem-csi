@@ -12,43 +12,45 @@ import (
 	"fmt"
 	"runtime"
 
-	"k8s.io/klog"
-
 	"github.com/intel/pmem-csi/pkg/apis"
-	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1alpha1"
+	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
 	"github.com/intel/pmem-csi/pkg/k8sutil"
-	"github.com/intel/pmem-csi/pkg/pmem-csi-operator/controller"
-	"github.com/intel/pmem-csi/pkg/pmem-csi-operator/controller/deployment"
-
-	//"github.com/intel/pmem-csi/pkg/pmem-operator/version"
+	"github.com/intel/pmem-csi/pkg/logger"
 	pmemcommon "github.com/intel/pmem-csi/pkg/pmem-common"
+	"github.com/intel/pmem-csi/pkg/pmem-csi-operator/controller"
 
-	"github.com/operator-framework/operator-sdk/pkg/leader"
-	"github.com/operator-framework/operator-sdk/pkg/restmapper"
-	sdkVersion "github.com/operator-framework/operator-sdk/version"
+	"github.com/operator-framework/operator-lib/leader"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+
+	// import deployment to ensure that the deployment reconciler get initialized.
+	_ "github.com/intel/pmem-csi/pkg/pmem-csi-operator/controller/deployment"
 )
 
 func printVersion() {
 	//klog.Info(fmt.Sprintf("Operator Version: %s", version.Version))
 	klog.Info(fmt.Sprintf("Go Version: %s", runtime.Version()))
 	klog.Info(fmt.Sprintf("Go OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH))
-	klog.Info(fmt.Sprintf("Version of operator-sdk: %v", sdkVersion.Version))
 }
 
-var driverImage string
+var (
+	driverImage  = flag.String("image", "", "docker container image used for deploying the operator.")
+	startWebhook = flag.Bool("webhook", false, "run conversion webhook server")
+	logFormat    = logger.NewFlag()
+)
 
 func init() {
-	klog.InitFlags(nil)
-	flag.StringVar(&driverImage, "image", "", "docker container image used for deploying the operator.")
+	// klog gets initialized by k8s.io/component-base/logs.
 
 	flag.Set("logtostderr", "true")
 }
 
 func Main() int {
 	flag.Parse()
+	logFormat.Apply()
 
 	printVersion()
 
@@ -59,17 +61,11 @@ func Main() int {
 		return 1
 	}
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	// Become the leader before proceeding
 	err = leader.Become(ctx, "pmem-csi-operator-lock")
 	if err != nil {
 		pmemcommon.ExitError("Failed to become leader: ", err)
-		return 1
-	}
-
-	klog.Info("Registering Deployment CRD.")
-	if err := deployment.EnsureCRDInstalled(cfg); err != nil {
-		pmemcommon.ExitError("Failed to install deployment CRD: ", err)
 		return 1
 	}
 
@@ -78,8 +74,7 @@ func Main() int {
 
 	// Create a new Cmd to provide shared dependencies and start components
 	mgr, err := manager.New(cfg, manager.Options{
-		Namespace:      namespace,
-		MapperProvider: restmapper.NewDynamicRESTMapper,
+		Namespace: namespace,
 	})
 	if err != nil {
 		pmemcommon.ExitError("Failed to create controller manager: ", err)
@@ -101,12 +96,18 @@ func Main() int {
 		return 1
 	}
 
+	cs, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		pmemcommon.ExitError("failed to get in-cluster client: %v", err)
+		return 1
+	}
 	// Setup all Controllers
-	if err := controller.AddToManager(mgr, controller.ControllerOptions{
-		Config:      mgr.GetConfig(),
-		Namespace:   namespace,
-		K8sVersion:  *ver,
-		DriverImage: driverImage,
+	if err := controller.AddToManager(ctx, mgr, controller.ControllerOptions{
+		Config:       mgr.GetConfig(),
+		Namespace:    namespace,
+		K8sVersion:   *ver,
+		DriverImage:  *driverImage,
+		EventsClient: cs.CoreV1().Events(""),
 	}); err != nil {
 		pmemcommon.ExitError("Failed to add controller to manager: ", err)
 		return 1
@@ -120,8 +121,8 @@ func Main() int {
 		return 1
 	}
 
-	list := &api.DeploymentList{}
-	if err := mgr.GetClient().List(context.TODO(), list); err != nil {
+	list := &api.PmemCSIDeploymentList{}
+	if err := mgr.GetClient().List(ctx, list); err != nil {
 		pmemcommon.ExitError("failed to get deployment list: %v", err)
 		return 1
 	}
@@ -136,11 +137,6 @@ func Main() int {
 	if len(activeList) != 0 {
 		klog.Infof("There are active PMEM-CSI deployments (%v), hence not deleting the CRD.", activeList)
 		return 0
-	}
-
-	if err := deployment.DeleteCRD(cfg); err != nil {
-		pmemcommon.ExitError("Failed to delete deployment CRD: ", err)
-		return 1
 	}
 
 	return 0

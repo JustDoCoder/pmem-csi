@@ -7,7 +7,10 @@ SPDX-License-Identifier: Apache-2.0
 package controller
 
 import (
+	"context"
+
 	"github.com/intel/pmem-csi/pkg/version"
+	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
@@ -22,15 +25,17 @@ type ControllerOptions struct {
 	DriverImage string
 	// Config kubernetes config used
 	Config *rest.Config
+	// EventClient events client to use for recording events
+	EventsClient v1.EventInterface
 }
 
 // AddToManagerFuncs is a list of functions to add all Controllers to the Manager
-var AddToManagerFuncs []func(manager.Manager, ControllerOptions) error
+var AddToManagerFuncs []func(context.Context, manager.Manager, ControllerOptions) error
 
 // AddToManager adds all Controllers to the Manager
-func AddToManager(m manager.Manager, opts ControllerOptions) error {
+func AddToManager(ctx context.Context, m manager.Manager, opts ControllerOptions) error {
 	for _, f := range AddToManagerFuncs {
-		if err := f(m, opts); err != nil {
+		if err := f(ctx, m, opts); err != nil {
 			return err
 		}
 	}

@@ -16,7 +16,7 @@
 GO_BINARY=go
 GO=GOOS=linux GO111MODULE=on $(GO_BINARY)
 IMPORT_PATH=github.com/intel/pmem-csi
-CMDS=pmem-csi-driver pmem-vgm pmem-ns-init pmem-csi-operator
+CMDS=pmem-csi-driver pmem-csi-operator
 TEST_CMDS=$(addsuffix -test,$(CMDS))
 SHELL=bash
 export PWD=$(shell pwd)
@@ -24,8 +24,15 @@ OUTPUT_DIR=_output
 .DELETE_ON_ERROR:
 
 ifeq ($(VERSION), )
-VERSION=$(shell git describe --long --dirty --tags --match='v*')
+VERSION:=$(shell git describe --long --dirty --tags --match='v*')
 endif
+
+# VERSION is of the format vX.Y.Z[-<number of commits>-<short hash>|<suffix>].
+# For the SDK we need just X.Y.Z.
+MAJOR_MINOR_PATCH_VERSION:=$(shell echo $(VERSION) | cut -f1 -d'-' | sed -e 's/^v//')
+
+# Sometimes just X.Y is needed.
+MAJOR_MINOR_VERSION:=$(shell echo $(MAJOR_MINOR_PATCH_VERSION) | sed -e 's/\([0-9]*\.[0-9]*\)\..*/\1/')
 
 # Sanitize proxy settings (accept upper and lower case, set and export upper
 # case) and add local machine to no_proxy because some tests may use a
@@ -79,14 +86,8 @@ $(CMDS): check-go-version-$(GO_BINARY)
 $(TEST_CMDS): %-test: check-go-version-$(GO_BINARY)
 	$(GO) test --cover -covermode=atomic -c -coverpkg=./pkg/... -ldflags '-X github.com/intel/pmem-csi/pkg/$*.version=${VERSION}' -o ${OUTPUT_DIR}/$@ ./cmd/$*
 
-# The default is to refresh the base image once a day when building repeatedly.
-# This is achieved by passing a fake variable that changes its value once per day.
-# A CI system that produces production images should instead use
-# `make  BUILD_IMAGE_ID=<some unique number>`.
-#
-# At the moment this build ID is not recorded in the resulting images.
-# The VERSION variable should be used for that, if desired.
-BUILD_IMAGE_ID?=$(shell date +%Y-%m-%d)
+# Set by the CI to ensure that image building really pulls a new base.
+CACHEBUST=
 
 # Build and publish images for production or testing (i.e. with test binaries).
 # Pushing images also automatically rebuilds the image first. This can be disabled
@@ -94,7 +95,7 @@ BUILD_IMAGE_ID?=$(shell date +%Y-%m-%d)
 build-images: build-image build-test-image
 push-images: push-image push-test-image
 build-image build-test-image: build%-image: populate-vendor-dir
-	docker build --pull --build-arg CACHEBUST=$(BUILD_IMAGE_ID) --build-arg GOFLAGS=-mod=vendor --build-arg BIN_SUFFIX=$(findstring -test,$*) $(BUILD_ARGS) -t $(IMAGE_TAG) -f ./Dockerfile . --label revision=$(VERSION)
+	docker build --pull --build-arg CACHEBUST=$(CACHEBUST) --build-arg GOFLAGS=-mod=vendor --build-arg BIN_SUFFIX=$(findstring -test,$*) $(BUILD_ARGS) -t $(IMAGE_TAG) -f ./Dockerfile . --label revision=$(VERSION)
 PUSH_IMAGE_DEP = build%-image
 # "docker push" has been seen to fail temporarily with "error creating overlay mount to /var/lib/docker/overlay2/xxx/merged: device or resource busy".
 # Here we simply try three times before giving up.
@@ -127,8 +128,6 @@ clean:
 
 .PHONY: all build test clean $(CMDS) $(TEST_CMDS)
 
-include operator/operator.make
-
 # Add support for creating and booting a cluster under QEMU.
 # All of the commands operate on a cluster stored in _work/$(CLUSTER),
 # which defaults to _work/clear-govm. This can be changed with
@@ -139,7 +138,7 @@ include test/start-stop.make
 include test/test.make
 
 #Kustomize latest release version
-KUSTOMIZE_VERSION=v3.4.0
+KUSTOMIZE_VERSION=v4.0.5
 _work/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz:
 	curl -L https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz -o $(abspath $@)
 
@@ -147,53 +146,72 @@ _work/kustomize: _work/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz
 	tar xzf $< -C _work
 	touch $@
 
+include operator/operator.make
+
 # We generate deployment files with kustomize and include the output
 # in the git repo because not all users will have kustomize or it
 # might be an unsuitable version. When any file changes, update the
 # output.
 KUSTOMIZE_INPUT := $(shell [ ! -d deploy/kustomize ] || find deploy/kustomize -type f)
 
-# Output files and their corresponding kustomize target.
+# Output files and their corresponding kustomization, in the format <target .yaml>=<kustomization directory>
+KUSTOMIZE :=
+
+# For each supported Kubernetes version, we provide four different flavors.
 # The "testing" flavor of the generated files contains both
 # the loglevel changes and enables coverage data collection.
-KUSTOMIZE_OUTPUT :=
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.15/pmem-csi-direct.yaml
-KUSTOMIZATION_deploy/kubernetes-1.15/pmem-csi-direct.yaml = deploy/kustomize/kubernetes-1.15-direct
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.15/pmem-csi-lvm.yaml
-KUSTOMIZATION_deploy/kubernetes-1.15/pmem-csi-lvm.yaml = deploy/kustomize/kubernetes-1.15-lvm
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.15/pmem-csi-direct-testing.yaml
-KUSTOMIZATION_deploy/kubernetes-1.15/pmem-csi-direct-testing.yaml = deploy/kustomize/kubernetes-1.15-direct-coverage
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.15/pmem-csi-lvm-testing.yaml
-KUSTOMIZATION_deploy/kubernetes-1.15/pmem-csi-lvm-testing.yaml = deploy/kustomize/kubernetes-1.15-lvm-coverage
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.16/pmem-csi-direct.yaml
-KUSTOMIZATION_deploy/kubernetes-1.16/pmem-csi-direct.yaml = deploy/kustomize/kubernetes-1.16-direct
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.16/pmem-csi-lvm.yaml
-KUSTOMIZATION_deploy/kubernetes-1.16/pmem-csi-lvm.yaml = deploy/kustomize/kubernetes-1.16-lvm
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.16/pmem-csi-direct-testing.yaml
-KUSTOMIZATION_deploy/kubernetes-1.16/pmem-csi-direct-testing.yaml = deploy/kustomize/kubernetes-1.16-direct-testing
-KUSTOMIZE_OUTPUT += deploy/kubernetes-1.16/pmem-csi-lvm-testing.yaml
-KUSTOMIZATION_deploy/kubernetes-1.16/pmem-csi-lvm-testing.yaml = deploy/kustomize/kubernetes-1.16-lvm-testing
-KUSTOMIZE_OUTPUT += deploy/common/pmem-storageclass-ext4.yaml
-KUSTOMIZATION_deploy/common/pmem-storageclass-ext4.yaml = deploy/kustomize/storageclass-ext4
-KUSTOMIZE_OUTPUT += deploy/common/pmem-storageclass-xfs.yaml
-KUSTOMIZATION_deploy/common/pmem-storageclass-xfs.yaml = deploy/kustomize/storageclass-xfs
-KUSTOMIZE_OUTPUT += deploy/common/pmem-storageclass-cache.yaml
-KUSTOMIZATION_deploy/common/pmem-storageclass-cache.yaml = deploy/kustomize/storageclass-cache
-KUSTOMIZE_OUTPUT += deploy/common/pmem-storageclass-late-binding.yaml
-KUSTOMIZATION_deploy/common/pmem-storageclass-late-binding.yaml = deploy/kustomize/storageclass-late-binding
-kustomize: _work/go-bindata clean_kustomize_output $(KUSTOMIZE_OUTPUT)
-	$< -o deploy/bindata_generated.go -pkg deploy deploy/kubernetes-*/*/pmem-csi.yaml
+KUSTOMIZE_KUBERNETES_OUTPUT = \
+    deploy/kubernetes-X.XX/pmem-csi-direct.yaml=deploy/kustomize/kubernetes-base-direct \
+    deploy/kubernetes-X.XX/pmem-csi-lvm.yaml=deploy/kustomize/kubernetes-base-lvm \
+    deploy/kubernetes-X.XX/pmem-csi-direct-testing.yaml=deploy/kustomize/kubernetes-base-direct-coverage \
+    deploy/kubernetes-X.XX/pmem-csi-lvm-testing.yaml=deploy/kustomize/kubernetes-base-lvm-coverage \
+
+KUSTOMIZE_KUBERNETES_VERSIONS = \
+    1.18 \
+    1.19 \
+    1.20 \
+
+KUSTOMIZE += $(foreach version,$(KUSTOMIZE_KUBERNETES_VERSIONS),$(subst X.XX,$(version),$(KUSTOMIZE_KUBERNETES_OUTPUT)))
+
+# Special case Kubernetes 1.19 with alpha features:
+# use different base.
+KUSTOMIZE += $(subst kubernetes-base,kubernetes-1.19-alpha,$(subst X.XX,1.19-alpha,$(KUSTOMIZE_KUBERNETES_OUTPUT)))
+
+KUSTOMIZE += deploy/common/pmem-storageclass-default.yaml=deploy/kustomize/storageclass
+KUSTOMIZE += deploy/common/pmem-storageclass-ext4.yaml=deploy/kustomize/storageclass-ext4
+KUSTOMIZE += deploy/common/pmem-storageclass-xfs.yaml=deploy/kustomize/storageclass-xfs
+KUSTOMIZE += deploy/common/pmem-storageclass-cache.yaml=deploy/kustomize/storageclass-cache
+KUSTOMIZE += deploy/common/pmem-storageclass-late-binding.yaml=deploy/kustomize/storageclass-late-binding
+KUSTOMIZE += deploy/operator/pmem-csi-operator.yaml=deploy/kustomize/operator
+
+KUSTOMIZE_OUTPUT := $(foreach item,$(KUSTOMIZE),$(firstword $(subst =, ,$(item))))
+
+# This function takes the name of a .yaml output file and returns the
+# corresponding kustomization as specified in KUSTOMIZE. It works by
+# iterating over all items and only return the second half of the
+# right one.
+KUSTOMIZE_LOOKUP_KUSTOMIZATION = $(strip $(foreach item,$(KUSTOMIZE),$(if $(filter $(1)=%,$(item)),$(word 2,$(subst =, ,$(item))))))
+
+# This function takes the kustomize binary and the name of an output
+# file as arguments and returns the command which produces that file
+# as stdout.
+KUSTOMIZE_INVOCATION = (echo '\# Generated with "make kustomize", do not edit!'; echo; $(1) build --load-restrictor LoadRestrictionsNone $(call KUSTOMIZE_LOOKUP_KUSTOMIZATION,$(2)))
 
 $(KUSTOMIZE_OUTPUT): _work/kustomize $(KUSTOMIZE_INPUT)
-	$< build --load_restrictor none $(KUSTOMIZATION_$@) >$@
-	if echo "$@" | grep -q '/pmem-csi-'; then \
-		dir=$$(echo "$@" | tr - / | sed -e 's;kubernetes/;kubernetes-;' -e 's/.yaml//' -e 's;/pmem/csi/;/;') && \
+	mkdir -p ${@D}
+	$(call KUSTOMIZE_INVOCATION,$<,$@) >$@
+	if echo "$@" | grep '/pmem-csi-' | grep -qv '\-operator'; then \
+		dir=$$(echo "$@" | tr - / | sed -e 's;kubernetes/;kubernetes-;' -e 's;/alpha/;-alpha/;'  -e 's;/distributed/;-distributed/;' -e 's/.yaml//' -e 's;/pmem/csi/;/;') && \
 		mkdir -p $$dir && \
 		cp $@ $$dir/pmem-csi.yaml && \
 		echo 'resources: [ pmem-csi.yaml ]' > $$dir/kustomization.yaml; \
 	fi
 
+kustomize: _work/go-bindata clean_kustomize_output $(KUSTOMIZE_OUTPUT)
+	$< -o deploy/bindata_generated.go -pkg deploy deploy/kubernetes-*/*/pmem-csi.yaml deploy/kustomize/webhook/webhook.yaml deploy/kustomize/scheduler/scheduler-service.yaml
+
 clean_kustomize_output:
+	rm -rf deploy/kubernetes-*
 	rm -f $(KUSTOMIZE_OUTPUT)
 
 # Always re-generate the output files because "git rebase" might have
@@ -217,7 +235,7 @@ _work/go-bindata:
 test: test-kustomize
 test-kustomize: $(addprefix test-kustomize-,$(KUSTOMIZE_OUTPUT))
 $(addprefix test-kustomize-,$(KUSTOMIZE_OUTPUT)): test-kustomize-%: _work/kustomize
-	@ if ! diff <($< build --load_restrictor none $(KUSTOMIZATION_$*)) $*; then echo "$* was modified manually" && false; fi
+	@ if ! diff <($(call KUSTOMIZE_INVOCATION,$<,$*)) $*; then echo "$* was modified manually" && false; fi
 
 # Targets in the makefile can depend on check-go-version-<path to go binary>
 # to trigger a warning if the x.y version of that binary does not match
@@ -241,7 +259,7 @@ GEN_DOCS = $(SPHINXBUILD) -M html "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O
 	( ! [ "$$GITHUB_SHA" ] || ! [ "$$GITHUB_REPOSITORY" ] || \
 	  find $(BUILDDIR)/html/ -name '*.html' | \
 	  xargs sed -i -e "s;github.com/intel/pmem-csi/\\(deploy/\\S*\\);github.com/$$GITHUB_REPOSITORY/\\1?ref=$$GITHUB_SHA;g" ) && \
-	cp docs/html/index.html $(BUILDDIR)/html/index.html
+	cp docs/html/index.html $(BUILDDIR)/html/index.html && cp docs/js/copybutton.js $(BUILDDIR)/html/_static/copybutton.js
 vhtml: _work/venv/.stamp
 	. _work/venv/bin/activate && $(GEN_DOCS)
 html:

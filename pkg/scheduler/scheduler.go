@@ -8,13 +8,15 @@ package scheduler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -23,7 +25,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	storagelisters "k8s.io/client-go/listers/storage/v1"
-	"k8s.io/klog/klogr"
+	"k8s.io/klog/v2/klogr"
 	schedulerapi "k8s.io/kube-scheduler/extender/v1"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -37,15 +39,64 @@ type Capacity interface {
 	NodeCapacity(nodeName string) (int64, error)
 }
 
+var (
+	inFlightGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "scheduler_in_flight_requests",
+		Help: "A gauge of HTTP requests currently being served by the PMEM-CSI scheduler.",
+	})
+
+	counter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "scheduler_requests_total",
+			Help: "A counter for HTTP requests to the PMEM-CSI scheduler.",
+		},
+		[]string{"code", "method"},
+	)
+
+	// duration is partitioned by the HTTP method and handler.
+	duration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "scheduler_request_duration_seconds",
+			Help: "A histogram of latencies for PMEM-CSI scheduler HTTP requests.",
+		},
+		[]string{"handler", "method"},
+	)
+
+	// responseSize has no labels, making it a zero-dimensional
+	// ObserverVec.
+	responseSize = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "scheduler_response_size_bytes",
+			Help:    "A histogram of response sizes for PMEM-CSI scheduler requests.",
+			Buckets: []float64{200, 500, 900, 1500},
+		},
+		[]string{},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(inFlightGauge, counter, duration, responseSize)
+}
+
+func wrapHTTPHandler(handlerName string, handler http.HandlerFunc) http.HandlerFunc {
+	return promhttp.InstrumentHandlerDuration(
+		duration.MustCurryWith(prometheus.Labels{"handler": handlerName}),
+		promhttp.InstrumentHandlerCounter(counter,
+			promhttp.InstrumentHandlerResponseSize(responseSize, handler),
+		),
+	)
+}
+
 type scheduler struct {
 	driverName string
 	capacity   Capacity
 	clientSet  kubernetes.Interface
 	pvcLister  corelisters.PersistentVolumeClaimLister
 	scLister   storagelisters.StorageClassLister
-	podMutator http.Handler
 	decoder    *admission.Decoder
 	log        logr.Logger
+
+	instrumentedFilter, instrumentedStatus, instrumentedMutate http.HandlerFunc
 }
 
 func NewScheduler(
@@ -74,7 +125,11 @@ func NewScheduler(
 	s.decoder = decoder
 	webhook := webhook.Admission{Handler: s}
 	webhook.InjectLogger(s.log.WithName("webhook"))
-	s.podMutator = &webhook
+
+	s.instrumentedFilter = wrapHTTPHandler("filter", s.filter)
+	s.instrumentedStatus = wrapHTTPHandler("status", s.status)
+	s.instrumentedMutate = wrapHTTPHandler("mutate", webhook.ServeHTTP)
+
 	return s, nil
 }
 
@@ -89,14 +144,14 @@ func (s *scheduler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.URL.Path {
 	case "/filter":
-		s.filter(w, r)
+		s.instrumentedFilter(w, r)
 	// TODO (?): prioritize nodes similar to https://github.com/cybozu-go/topolvm/blob/master/scheduler/prioritize.go
 	// case "/prioritize":
 	// 	s.prioritize(w, r)
 	case "/status":
-		s.status(w, r)
+		s.instrumentedStatus(w, r)
 	case "/pod/mutate":
-		s.podMutator.ServeHTTP(w, r)
+		s.instrumentedMutate(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -127,7 +182,6 @@ func (s *scheduler) filter(w http.ResponseWriter, r *http.Request) {
 		s.log.Error(err, "JSON encoding")
 		w.WriteHeader(http.StatusInternalServerError)
 	} else {
-		s.log.V(5).Info("node filter", "result", string(response))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(response)
@@ -139,11 +193,16 @@ func (s *scheduler) filter(w http.ResponseWriter, r *http.Request) {
 // complicated to implement and should better be handled generically for volumes
 // in Kubernetes.
 func (s *scheduler) doFilter(args schedulerapi.ExtenderArgs) (*schedulerapi.ExtenderFilterResult, error) {
-	var filteredNodes []v1.Node
+	var filteredNodes []string
 	failedNodes := make(schedulerapi.FailedNodesMap)
+	if args.Pod == nil ||
+		args.Pod.Name == "" ||
+		(args.NodeNames == nil && args.Nodes == nil) {
+		return nil, errors.New("incomplete parameters")
+	}
 
 	log := s.log.WithValues("pod", args.Pod.Name)
-	log.V(5).Info("node filter request", "potential nodes", nodeNames(args.Nodes.Items))
+	log.V(5).Info("node filter", "request", args)
 	required, err := s.requiredStorage(args.Pod)
 	if err != nil {
 		return nil, fmt.Errorf("checking for unbound volumes: %v", err)
@@ -152,43 +211,57 @@ func (s *scheduler) doFilter(args schedulerapi.ExtenderArgs) (*schedulerapi.Exte
 
 	var mutex sync.Mutex
 	var waitgroup sync.WaitGroup
-	for _, node := range args.Nodes.Items {
+	var nodeNames []string
+	if args.NodeNames != nil {
+		nodeNames = *args.NodeNames
+	} else {
+		// Fallback for Extender.NodeCacheCapable == false:
+		// not recommended, but may still be used by users who followed the
+		// PMEM-CSI 0.7 setup instructions.
+		log.Info("NodeCacheCapable is false in Extender configuration, should be set to true.")
+		nodeNames = listNodeNames(args.Nodes.Items)
+	}
+	for _, nodeName := range nodeNames {
 		if required == 0 {
 			// Nothing to check.
-			filteredNodes = append(filteredNodes, node)
+			filteredNodes = append(filteredNodes, nodeName)
 			continue
 		}
 
 		// Check in parallel.
-		node := node
+		nodeName := nodeName
 		waitgroup.Add(1)
 		go func() {
-			fits, failReasons, err := s.nodeHasEnoughCapacity(required, node)
+			err := s.nodeHasEnoughCapacity(required, nodeName)
+
 			mutex.Lock()
 			defer mutex.Unlock()
 			defer waitgroup.Done()
-			switch {
-			case fits:
-				filteredNodes = append(filteredNodes, node)
-			case failReasons != nil:
-				failedNodes[node.Name] = strings.Join(failReasons, ",")
-			case err != nil:
-				failedNodes[node.Name] = fmt.Sprintf("checking for capacity: %v", err)
+			switch err {
+			case nil:
+				filteredNodes = append(filteredNodes, nodeName)
+			default:
+				failedNodes[nodeName] = err.Error()
 			}
 		}()
 	}
 	waitgroup.Wait()
 
-	log.V(5).Info("node filter result",
-		"suitable nodes", nodeNames(filteredNodes),
-		"failed nodes", failedNodes)
-	return &schedulerapi.ExtenderFilterResult{
-		Nodes: &v1.NodeList{
-			Items: filteredNodes,
-		},
+	response := &schedulerapi.ExtenderFilterResult{
 		FailedNodes: failedNodes,
 		Error:       "",
-	}, nil
+	}
+	if args.NodeNames != nil {
+		response.NodeNames = &filteredNodes
+	} else {
+		// fallback response...
+		response.Nodes = &v1.NodeList{}
+		for _, node := range filteredNodes {
+			response.Nodes.Items = append(response.Nodes.Items, getNode(args.Nodes.Items, node))
+		}
+	}
+	log.V(5).Info("node filter", "response", response)
+	return response, nil
 }
 
 // requiredStorage sums up total size of all currently unbound
@@ -254,30 +327,38 @@ func (s *scheduler) requiredStorage(pod *v1.Pod) (int64, error) {
 	return total, nil
 }
 
-// nodeHasEnoughCapacity determines whether a node has enough storage available. It either returns
-// true if yes, a list of explanations why not, or an error if checking failed.
-func (s *scheduler) nodeHasEnoughCapacity(required int64, node v1.Node) (bool, []string, error) {
-	available, err := s.capacity.NodeCapacity(node.Name)
+// nodeHasEnoughCapacity determines whether a node has enough storage available. It returns
+// an error if not, otherwise nil.
+func (s *scheduler) nodeHasEnoughCapacity(required int64, nodeName string) error {
+	available, err := s.capacity.NodeCapacity(nodeName)
 	if err != nil {
-		return false, nil, fmt.Errorf("retrieve capacity: %v", err)
+		return fmt.Errorf("retrieve capacity: %v", err)
 	}
 
 	if available < required {
-		return false, []string{fmt.Sprintf("only %vB of PMEM available, need %vB",
+		return fmt.Errorf("only %vB of PMEM available, need %vB",
 			resource.NewQuantity(available, resource.BinarySI),
-			resource.NewQuantity(required, resource.BinarySI)),
-		}, nil
+			resource.NewQuantity(required, resource.BinarySI))
 	}
 
 	// Success!
-	return true, nil, nil
+	return nil
 }
 
-func nodeNames(nodes []v1.Node) []string {
+func listNodeNames(nodes []v1.Node) []string {
 	var names []string
 	for _, node := range nodes {
 		names = append(names, node.Name)
 	}
 	sort.Strings(names)
 	return names
+}
+
+func getNode(nodes []v1.Node, nodeName string) v1.Node {
+	for _, node := range nodes {
+		if node.Name == nodeName {
+			return node
+		}
+	}
+	return v1.Node{}
 }

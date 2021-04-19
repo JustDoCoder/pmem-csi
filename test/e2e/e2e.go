@@ -30,11 +30,12 @@ import (
 	"github.com/onsi/gomega"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/kubernetes/test/e2e/framework"
-	"k8s.io/kubernetes/test/e2e/framework/ginkgowrapper"
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
-	"k8s.io/kubernetes/test/e2e/framework/podlogs"
+	"k8s.io/kubernetes/test/e2e/storage/podlogs"
 )
 
 // There are certain operations we only want to run once per overall test invocation
@@ -51,9 +52,16 @@ var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 
 	framework.Logf("checking config")
 
-	c, err := framework.LoadClientset()
+	// We don't want WaitForPodsRunningReady and pod logging to be throttled.
+	// Therefore we set a fake rate limiter which never throttles.
+	config, err := framework.LoadConfig()
 	if err != nil {
-		framework.Failf("Error loading client: %v", err)
+		framework.Failf("error creating client config: %v", err)
+	}
+	config.RateLimiter = flowcontrol.NewFakeAlwaysRateLimiter()
+	c, err := clientset.NewForConfig(config)
+	if err != nil {
+		framework.Failf("error creating client: %v", err)
 	}
 
 	if framework.TestContext.ReportDir != "" {
@@ -111,6 +119,10 @@ var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 	}
 	podlogs.CopyAllLogs(ctx, c, "default", to)
 	podlogs.WatchPods(ctx, c, "default", ginkgo.GinkgoWriter)
+	// capture operator logs, they are supposed to run in operator-test namespace
+	// as defined in deploy/deploy.go
+	podlogs.CopyAllLogs(ctx, c, "operator-test", to)
+	podlogs.WatchPods(ctx, c, "operator-test", ginkgo.GinkgoWriter)
 
 	dc := c.DiscoveryClient
 
@@ -146,7 +158,8 @@ var _ = ginkgo.SynchronizedAfterSuite(func() {
 // E2E tests using the Ginkgo runner.
 // This function is called on each Ginkgo node in parallel mode.
 func RunE2ETests(t *testing.T) {
-	gomega.RegisterFailHandler(ginkgowrapper.Fail)
+	// Log failure immediately in addition to recording the test failure.
+	gomega.RegisterFailHandler(framework.Fail)
 
 	// Run tests through the Ginkgo runner with output to console + JUnit for Jenkins
 	var r []ginkgo.Reporter

@@ -3,20 +3,24 @@ package pmdmanager
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 
+	api "github.com/intel/pmem-csi/pkg/apis/pmemcsi/v1beta1"
+	pmemerr "github.com/intel/pmem-csi/pkg/errors"
 	"github.com/intel/pmem-csi/pkg/ndctl"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/mount"
 )
 
 const (
 	// 1 GB align in ndctl creation request has proven to be reliable.
-	// Newer kernels may allow smaller alignment but we do not want to introduce kernel depenency.
+	// Newer kernels may allow smaller alignment but we do not want to introduce kernel dependency.
 	ndctlAlign uint64 = 1024 * 1024 * 1024
 )
 
 type pmemNdctl struct {
+	pmemPercentage uint
 }
 
 var _ PmemDeviceManager = &pmemNdctl{}
@@ -28,39 +32,94 @@ var _ PmemDeviceManager = &pmemNdctl{}
 var ndctlMutex = &sync.Mutex{}
 
 //NewPmemDeviceManagerNdctl Instantiates a new ndctl based pmem device manager
-func NewPmemDeviceManagerNdctl() (PmemDeviceManager, error) {
-	// Check is /sys writable. If not then there is no point starting
-	mounts, _ := mount.New("").List()
-	for _, mnt := range mounts {
-		if mnt.Device == "sysfs" && mnt.Path == "/sys" {
-			klog.V(5).Infof("NewPmemDeviceManagerNdctl: sysfs mount options:%s", mnt.Opts)
-			for _, opt := range mnt.Opts {
-				if opt == "rw" {
-					klog.V(4).Info("NewPmemDeviceManagerNdctl: /sys mounted read-write, good")
-					return &pmemNdctl{}, nil
-				} else if opt == "ro" {
-					return nil, fmt.Errorf("FATAL: /sys mounted read-only, can not operate")
-				}
+// FIXME(avalluri): consider pmemPercentage while calculating available space
+func newPmemDeviceManagerNdctl(pmemPercentage uint) (PmemDeviceManager, error) {
+	if pmemPercentage > 100 {
+		return nil, fmt.Errorf("invalid pmemPercentage '%d'. Value must be 0..100", pmemPercentage)
+	}
+
+	writable, err := sysIsWritable()
+	if err != nil {
+		return nil, fmt.Errorf("check for writable /sys: %v", err)
+	}
+
+	if !writable {
+		// If /host-sys exists, then bind mount it to /sys.  This is a
+		// workaround for /sys being read-only on OpenShift 4.5
+		// (https://github.com/intel/pmem-csi/issues/786 =
+		// https://github.com/containerd/containerd/issues/3221).
+		_, err := os.Stat("/host-sys")
+		switch {
+		case err == nil:
+			if err := mount.New("").Mount("/host-sys", "/sys", "", []string{"rw", "bind", "seclabel", "nosuid", "nodev", "noexec", "relatime"}); err != nil {
+				return nil, fmt.Errorf("bind-mount /host-sys onto /sys: %v", err)
 			}
-			return nil, fmt.Errorf("FATAL: /sys mount entry exists but does not have neither 'rw' or 'ro' option")
+
+			// Check again, just to be sure.
+			writable, err = sysIsWritable()
+			if err != nil {
+				return nil, fmt.Errorf("check for writable /sys: %v", err)
+			}
+			if !writable {
+				return nil, errors.New("bind-mounting /host-sys to /sys did not result in writable /sys")
+			}
+		case os.IsNotExist(err):
+			// Can't fix the write-only /sys.
+			return nil, errors.New("/sys mounted read-only, can not operate")
+		default:
+			return nil, fmt.Errorf("/sys mounted read-only and access to /host-sys fallback failed: %v", err)
 		}
 	}
-	return nil, fmt.Errorf("FATAL: /sys mount entry not present")
+
+	return &pmemNdctl{pmemPercentage: pmemPercentage}, nil
 }
 
-func (pmem *pmemNdctl) GetCapacity() (uint64, error) {
+// sysIsWritable returns true if any of the /sys mounts is writable.
+func sysIsWritable() (bool, error) {
+	mounts, err := mount.New("").List()
+	if err != nil {
+		return false, fmt.Errorf("list mounts: %v", err)
+	}
+	for _, mnt := range mounts {
+		if mnt.Device == "sysfs" && mnt.Path == "/sys" {
+			klog.V(5).Infof("/sys mount options:%s", mnt.Opts)
+			for _, opt := range mnt.Opts {
+				if opt == "rw" {
+					klog.V(4).Info("/sys mounted read-write, good")
+					return true, nil
+				} else if opt == "ro" {
+					klog.V(4).Info("/sys mounted read-only, bad")
+				}
+			}
+			klog.V(4).Info("/sys mounted with unknown options, bad")
+		}
+	}
+	return false, nil
+}
+
+func (pmem *pmemNdctl) GetMode() api.DeviceMode {
+	return api.DeviceModeDirect
+}
+
+func (pmem *pmemNdctl) GetCapacity() (capacity Capacity, err error) {
 	ndctlMutex.Lock()
 	defer ndctlMutex.Unlock()
 
-	ndctx, err := ndctl.NewContext()
+	var ndctx *ndctl.Context
+	ndctx, err = ndctl.NewContext()
 	if err != nil {
-		return 0, err
+		return
 	}
 	defer ndctx.Free()
 
-	var capacity uint64
 	for _, bus := range ndctx.GetBuses() {
-		for _, r := range bus.ActiveRegions() {
+		for _, r := range bus.AllRegions() {
+			capacity.Total += r.Size()
+			// TODO: check type?!
+			if !r.Enabled() {
+				continue
+			}
+
 			realalign := ndctlAlign * r.InterleaveWays()
 			available := r.MaxAvailableExtent()
 			// align down, avoid claiming more than what we really can serve
@@ -68,9 +127,11 @@ func (pmem *pmemNdctl) GetCapacity() (uint64, error) {
 			available /= realalign
 			available *= realalign
 			klog.V(4).Infof("GetCapacity: available after realalign: %d", available)
-			if available > capacity {
-				capacity = available
+			if available > capacity.MaxVolumeSize {
+				capacity.MaxVolumeSize = available
 			}
+			capacity.Available += available
+			capacity.Managed += r.Size()
 		}
 	}
 	// TODO: we should maintain capacity when adding or subtracting
@@ -94,7 +155,7 @@ func (pmem *pmemNdctl) CreateDevice(volumeId string, size uint64) error {
 	// Avoid device filling with garbage entries by returning error.
 	// Overall, no point having more than one namespace with same name.
 	if _, err := getDevice(ndctx, volumeId); err == nil {
-		return ErrDeviceExists
+		return pmemerr.DeviceExists
 	}
 
 	// libndctl needs to store meta data and will use some of the allocated
@@ -140,13 +201,13 @@ func (pmem *pmemNdctl) DeleteDevice(volumeId string, flush bool) error {
 
 	device, err := getDevice(ndctx, volumeId)
 	if err != nil {
-		if errors.Is(err, ErrDeviceNotFound) {
+		if errors.Is(err, pmemerr.DeviceNotFound) {
 			return nil
 		}
 		return err
 	}
 	if err := clearDevice(device, flush); err != nil {
-		if errors.Is(err, ErrDeviceNotFound) {
+		if errors.Is(err, pmemerr.DeviceNotFound) {
 			return nil
 		}
 		return err
@@ -187,10 +248,7 @@ func (pmem *pmemNdctl) ListDevices() ([]*PmemDeviceInfo, error) {
 func getDevice(ndctx *ndctl.Context, volumeId string) (*PmemDeviceInfo, error) {
 	ns, err := ndctx.GetNamespaceByName(volumeId)
 	if err != nil {
-		if errors.Is(err, ndctl.ErrNotExist) {
-			return nil, ErrDeviceNotFound
-		}
-		return nil, fmt.Errorf("error getting device %q: %v", volumeId, err)
+		return nil, fmt.Errorf("error getting device %q: %w", volumeId, err)
 	}
 
 	return namespaceToPmemInfo(ns), nil
@@ -202,4 +260,22 @@ func namespaceToPmemInfo(ns *ndctl.Namespace) *PmemDeviceInfo {
 		Path:     "/dev/" + ns.BlockDeviceName(),
 		Size:     ns.Size(),
 	}
+}
+
+// totalSize sums up all PMEM regions, regardless whether they are
+// enabled and regardless of their mode.
+func totalSize() (size uint64, err error) {
+	var ndctx *ndctl.Context
+	ndctx, err = ndctl.NewContext()
+	if err != nil {
+		return
+	}
+	defer ndctx.Free()
+
+	for _, bus := range ndctx.GetBuses() {
+		for _, region := range bus.AllRegions() {
+			size += region.Size()
+		}
+	}
+	return
 }

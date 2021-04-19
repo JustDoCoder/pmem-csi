@@ -3,83 +3,83 @@ module github.com/intel/pmem-csi
 go 1.13
 
 require (
-	github.com/container-storage-interface/spec v1.2.0
+	github.com/aws/aws-sdk-go v1.35.37 // indirect
+	github.com/container-storage-interface/spec v1.3.0
 	github.com/docker/spdystream v0.0.0-20181023171402-6480d4af844c // indirect
 	github.com/go-bindata/go-bindata v3.1.2+incompatible
-	github.com/go-logr/logr v0.1.0
-	github.com/golang/groupcache v0.0.0-20191027212112-611e8accdfc9 // indirect
-	github.com/golang/protobuf v1.3.2
-	github.com/google/go-cmp v0.3.1 // indirect
-	github.com/google/uuid v1.1.1
-	github.com/hashicorp/golang-lru v0.5.3 // indirect
-	github.com/imdario/mergo v0.3.8 // indirect
-	github.com/kubernetes-csi/csi-lib-utils v0.6.1
-	github.com/kubernetes-csi/csi-test/v3 v3.1.0
-	github.com/onsi/ginkgo v1.11.0
-	github.com/onsi/gomega v1.8.1
-	github.com/operator-framework/operator-sdk v0.13.0
-	github.com/pkg/errors v0.8.1
-	github.com/prometheus/client_golang v1.1.0
-	github.com/prometheus/common v0.6.0
-	github.com/prometheus/procfs v0.0.5 // indirect
-	github.com/stretchr/testify v1.4.0
-	go.uber.org/multierr v1.2.0 // indirect
-	go.uber.org/zap v1.11.0 // indirect
-	golang.org/x/net v0.0.0-20191112182307-2180aed22343
-	golang.org/x/sys v0.0.0-20191113165036-4c7a9d0fe056
-	golang.org/x/time v0.0.0-20191024005414-555d28b269f0 // indirect
-	google.golang.org/appengine v1.6.5 // indirect
-	google.golang.org/grpc v1.26.0
+	github.com/go-logr/logr v0.4.0
+	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/google/go-cmp v0.5.4
+	github.com/google/gofuzz v1.2.0 // indirect
+	github.com/google/uuid v1.2.0
+	github.com/googleapis/gnostic v0.5.4 // indirect
+	github.com/imdario/mergo v0.3.11 // indirect
+	github.com/kubernetes-csi/csi-lib-utils v0.9.1
+	github.com/kubernetes-csi/csi-test/v3 v3.1.1
+	github.com/miekg/dns v1.1.38 // indirect
+	github.com/nxadm/tail v1.4.8 // indirect
+	github.com/onsi/ginkgo v1.14.2
+	github.com/onsi/gomega v1.10.5
+	github.com/operator-framework/operator-lib v0.4.0
+	github.com/prometheus/client_golang v1.9.0
+	github.com/prometheus/client_model v0.2.0
+	github.com/prometheus/common v0.15.0
+	github.com/prometheus/procfs v0.5.0 // indirect
+	github.com/stretchr/testify v1.6.1
+	go.uber.org/multierr v1.6.0 // indirect
+	go.uber.org/zap v1.16.0 // indirect
+	golang.org/x/net v0.0.0-20210119194325-5f4716e94777
+	golang.org/x/sys v0.0.0-20210124154548-22da62e12c0c
+	golang.org/x/text v0.3.5 // indirect
+	google.golang.org/appengine v1.6.7 // indirect
+	google.golang.org/genproto v0.0.0-20210207032614-bba0dbe2a9ea // indirect
+	google.golang.org/grpc v1.35.0
 	gopkg.in/freddierice/go-losetup.v1 v1.0.0-20170407175016-fc9adea44124
-	gopkg.in/square/go-jose.v2 v2.4.0 // indirect
-	gopkg.in/yaml.v2 v2.2.8
-	k8s.io/api v0.18.1
-	k8s.io/apiextensions-apiserver v0.18.1
-	k8s.io/apimachinery v0.18.1
+	gopkg.in/yaml.v2 v2.3.0
+	honnef.co/go/tools v0.0.1-2020.1.4 // indirect
+	k8s.io/api v0.20.2
+	k8s.io/apiextensions-apiserver v0.20.1
+	k8s.io/apimachinery v0.20.2
 	k8s.io/client-go v12.0.0+incompatible
-	k8s.io/component-base v0.18.1
-	k8s.io/klog v1.0.0
-	k8s.io/kube-scheduler v0.18.1
-	k8s.io/kubernetes v1.18.1
-	k8s.io/utils v0.0.0-20200414100711-2df71ebbae66
-	// Master is required because only that supports Kubernetes 1.18.
-	sigs.k8s.io/controller-runtime v0.5.1-0.20200414221803-bac7e8aaf90a
+	k8s.io/component-base v0.20.2
+	k8s.io/klog/v2 v2.5.0
+	k8s.io/kube-scheduler v0.20.2
+	k8s.io/kubectl v0.20.2
+	k8s.io/kubernetes v1.20.2
+	k8s.io/utils v0.0.0-20210111153108-fddb29f9d009
+	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.0.15 // indirect
+	sigs.k8s.io/controller-runtime v0.8.1
+	sigs.k8s.io/sig-storage-lib-external-provisioner/v6 v6.2.0
+	sigs.k8s.io/yaml v1.2.0
 )
 
 replace (
-	k8s.io/api => k8s.io/api v0.18.1
-	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.18.1
-	k8s.io/apimachinery => k8s.io/apimachinery v0.18.1
-	k8s.io/apiserver => k8s.io/apiserver v0.18.1
-	k8s.io/cli-runtime => k8s.io/cli-runtime v0.18.1
-	k8s.io/client-go => k8s.io/client-go v0.18.1
-	k8s.io/cloud-provider => k8s.io/cloud-provider v0.18.1
-	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.18.1
-	k8s.io/code-generator => k8s.io/code-generator v0.18.1
-	k8s.io/component-base => k8s.io/component-base v0.18.1
-	k8s.io/cri-api => k8s.io/cri-api v0.18.1
-	k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.18.1
-	k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.18.1
-	k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.18.1
-	k8s.io/kube-proxy => k8s.io/kube-proxy v0.18.1
-	k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.18.1
-	k8s.io/kubectl => k8s.io/kubectl v0.18.1
-	k8s.io/kubelet => k8s.io/kubelet v0.18.1
-	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.18.1
-	k8s.io/metrics => k8s.io/metrics v0.18.1
-	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.18.1
-	k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.18.1
-	k8s.io/sample-controller => k8s.io/sample-controller v0.18.1
+	k8s.io/api => k8s.io/api v0.20.2
+	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.20.2
+	k8s.io/apimachinery => k8s.io/apimachinery v0.21.0-alpha.0
+	k8s.io/apiserver => k8s.io/apiserver v0.20.2
+	k8s.io/cli-runtime => k8s.io/cli-runtime v0.20.2
+	k8s.io/client-go => k8s.io/client-go v0.20.2
+	k8s.io/cloud-provider => k8s.io/cloud-provider v0.20.2
+	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.20.2
+	k8s.io/code-generator => k8s.io/code-generator v0.20.3-rc.0
+	k8s.io/component-base => k8s.io/component-base v0.20.2
+	k8s.io/controller-manager => k8s.io/controller-manager v0.20.2
+	k8s.io/cri-api => k8s.io/cri-api v0.20.3-rc.0
+	k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.20.2
+	k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.20.2
+	k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.20.2
+	k8s.io/kube-proxy => k8s.io/kube-proxy v0.20.2
+	k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.20.2
+	k8s.io/kubectl => k8s.io/kubectl v0.20.2
+	k8s.io/kubelet => k8s.io/kubelet v0.20.2
+	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.20.2
+	k8s.io/metrics => k8s.io/metrics v0.20.2
+	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.20.2
+	k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.20.2
+	k8s.io/sample-controller => k8s.io/sample-controller v0.20.2
 )
 
-//  Operator:-  To resolve below ambigutiy, pin Azure/go-autorest/autorest to v13.3.0
-// 	github.com/Azure/go-autorest/autorest: ambiguous import: found github.com/Azure/go-autorest/autorest in multiple modules:
-//	github.com/Azure/go-autorest v11.1.0+incompatible (/home/avalluri/work/go/pkg/mod/github.com/!azure/go-autorest@v11.1.0+incompatible/autorest)
-//	github.com/Azure/go-autorest/autorest v0.9.0 (/home/avalluri/work/go/pkg/mod/github.com/!azure/go-autorest/autorest@v0.9.0)
-replace github.com/Azure/go-autorest => github.com/Azure/go-autorest v13.3.0+incompatible
+replace k8s.io/component-helpers => k8s.io/component-helpers v0.20.2
 
-// Temporary fork based on 1.18.1 with additional PRs:
-// - https://github.com/kubernetes/kubernetes/pull/89819
-// - https://github.com/kubernetes/kubernetes/pull/90214
-// - https://github.com/kubernetes/kubernetes/pull/90335
-replace k8s.io/kubernetes => github.com/pohly/kubernetes v1.18.1-pmem-csi-20200421-2
+replace k8s.io/mount-utils => k8s.io/mount-utils v0.20.2

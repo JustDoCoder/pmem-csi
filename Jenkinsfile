@@ -18,7 +18,7 @@ pipeline {
         /*
           Delay in seconds between dumping system statistics.
         */
-        LOGGING_SAMPLING_DELAY = "60"
+        LOGGING_SAMPLING_DELAY = "infinity"
 
         /*
           Pod names in the kube-system namespace for which
@@ -53,6 +53,10 @@ pipeline {
         // Set below via a script, must *not* be set here as it can't be overwritten.
         // BUILD_TARGET = ""
 
+        // CACHEBUST is passed when building images to ensure that the base layer gets
+        // updated when building releases.
+        // CACHEBUST = ""
+
         // This image is pulled at the beginning and used as cache.
         // TODO: Here we use "canary" which is correct for the "devel" branch, but other
         // branches may need something else to get better caching.
@@ -77,6 +81,8 @@ pipeline {
 
                 withDockerRegistry([ credentialsId: "${env.DOCKER_REGISTRY}", url: "https://${REGISTRY_NAME}" ]) {
                     script {
+                        env.CACHEBUST = ""
+
                         // Despite its name, GIT_LOCAL_BRANCH contains the tag name when building a tag.
                         // At some point it also contained the branch name when building
                         // a branch, but not anymore, therefore we fall back to BRANCH_NAME
@@ -85,6 +91,7 @@ pipeline {
                         // then we have GIT_BRANCH.
                         if (env.GIT_LOCAL_BRANCH != null) {
                             env.BUILD_TARGET = env.GIT_LOCAL_BRANCH
+                            env.CACHEBUST = env.GIT_LOCAL_BRANCH
                         } else if ( env.BRANCH_NAME != null ) {
                             env.BUILD_TARGET = env.BRANCH_NAME
                         } else {
@@ -96,44 +103,14 @@ pipeline {
                             // Pull previous image and use it as cache (https://andrewlock.net/caching-docker-layers-on-serverless-build-hosts-with-multi-stage-builds---target,-and---cache-from/).
                             sh ( script: "docker image pull ${env.BUILD_IMAGE} || true")
                             sh ( script: "docker image pull ${env.PMEM_CSI_IMAGE} || true")
-
-                            // PR jobs need to use the same CACHEBUST value as the latest build for their
-                            // target branch, otherwise they cannot reuse the cached layers. Another advantage
-                            // is that they use a version of Clear Linux that is known to work, because "swupd update"
-                            // will be cached.
-                            env.CACHEBUST = sh ( script: "docker inspect -f '{{ .Config.Labels.cachebust }}' ${env.BUILD_IMAGE} 2>/dev/null || true", returnStdout: true).trim()
                         } else {
                             env.BUILD_IMAGE = "${env.REGISTRY_NAME}/pmem-clearlinux-builder:${env.BRANCH_NAME}-rejected"
-                        }
-
-                        if (env.CACHEBUST == null || env.CACHEBUST == "") {
-                            env.CACHEBUST = env.BUILD_ID
                         }
                     }
                     sh "env; echo Building BUILD_IMAGE=${env.BUILD_IMAGE} for BUILD_TARGET=${env.BUILD_TARGET}, CHANGE_ID=${env.CHANGE_ID}, CACHEBUST=${env.CACHEBUST}."
                     sh "docker build --cache-from ${env.BUILD_IMAGE} --label cachebust=${env.CACHEBUST} --target build --build-arg CACHEBUST=${env.CACHEBUST} -t ${env.BUILD_IMAGE} ."
 
                     PrepareEnv()
-                }
-            }
-        }
-
-        stage('update base image') {
-            // Update the base image before doing a full build + test cycle. If that works,
-            // we push the new commits to GitHub.
-            when { environment name: 'JOB_BASE_NAME', value: 'pmem-csi-release' }
-
-            steps {
-                script {
-                    status = sh ( script: "${RunInBuilder()} ${env.BUILD_CONTAINER} hack/create-new-release.sh", returnStatus: true )
-                    if ( status == 2 ) {
-                        // https://stackoverflow.com/questions/42667600/abort-current-build-from-pipeline-in-jenkins
-                        currentBuild.result = 'ABORTED'
-                        error('No new release, aborting...')
-                    }
-                    if ( status != 0 ) {
-                        error("Creating a new release failed.")
-                    }
                 }
             }
         }
@@ -163,7 +140,7 @@ pipeline {
             steps {
                 // This builds images for REGISTRY_NAME with the version automatically determined by
                 // the make rules.
-                sh "${RunInBuilder()} ${env.BUILD_CONTAINER} make build-images"
+                sh "${RunInBuilder()} ${env.BUILD_CONTAINER} make build-images CACHEBUST=${env.CACHEBUST}"
 
                 // For testing we have to have those same images also in a registry. Tag and push for
                 // localhost, which is the default test registry.
@@ -197,56 +174,42 @@ pipeline {
 
         // Some stages are skipped entirely when testing PRs, the
         // others skip certain tests in that case:
-        // - production deployment is only tested on Clear Linux
-        //   and testing deployment only on Fedora
+        // - production deployment is only tested with Kubernetes 1.16
+        //   and testing deployment only with Kubernetes 1.18
         stage('Testing') {
             parallel {
                 // This runs most tests and thus gets to use the initial worker immediately.
-                stage('1.18') {
+                stage('1.20') {
                     options {
-                        timeout(time: 240, unit: "MINUTES")
+                        timeout(time: 14, unit: "HOURS")
                     }
                     steps {
-                        TestInVM("", "fedora", "", "1.18", "Top.Level..[[:alpha:]]*-production[[:space:]]")
+                        TestInVM("", "fedora", "", "1.20", "Top.Level..[[:alpha:]]*-production[[:space:]]")
                     }
                 }
 
                 // All others set up their own worker.
-                stage('1.16') {
-                    when { not { changeRequest() } }
+                stage('1.19') {
                     options {
-                        timeout(time: 240, unit: "MINUTES")
+                        timeout(time: 540, unit: "MINUTES")
                     }
                     agent {
                         label "pmem-csi"
                     }
                     steps {
-                        TestInVM("fedora-1.16", "fedora", "", "1.16", "")
+                        TestInVM("fedora-1.19", "fedora", "", "1.19", "Top.Level..[[:alpha:]]*-production[[:space:]]")
                     }
                 }
-
-                stage('1.15') {
+                stage('1.18') {
                     when { not { changeRequest() } }
                     options {
-                        timeout(time: 240, unit: "MINUTES")
+                        timeout(time: 540, unit: "MINUTES")
                     }
                     agent {
                         label "pmem-csi"
                     }
                     steps {
-                        TestInVM("fedora-1.15", "fedora", "", "1.15", "")
-                    }
-                }
-
-                stage('Clear Linux, 1.17') {
-                    options {
-                        timeout(time: 240, unit: "MINUTES")
-                    }
-                    agent {
-                        label "pmem-csi"
-                    }
-                    steps {
-                        TestInVM("clear-1.17", "clear", "${env.CLEAR_LINUX_VERSION_1_17}", "",  "Top.Level..[[:alpha:]]*-testing[[:space:]]")
+                        TestInVM("fedora-1.18", "fedora", "", "1.18", "")
                     }
                 }
             }
@@ -302,7 +265,7 @@ git push origin HEAD:master
                 sh "imageversion=\$(${RunInBuilder()} ${env.BUILD_CONTAINER} make print-image-version) && \
                     expectedversion=\$(echo '${env.BUILD_TARGET}' | sed -e 's/devel/canary/') && \
                     if [ \"\$imageversion\" = \"\$expectedversion\" ] ; then \
-                        ${RunInBuilder()} ${env.BUILD_CONTAINER} make push-images PUSH_IMAGE_DEP=; \
+                        ${RunInBuilder()} ${env.BUILD_CONTAINER} make push-images CACHEBUST=${env.CACHEBUST} PUSH_IMAGE_DEP=; \
                     else \
                         echo \"Skipping the pushing of PMEM-CSI driver images with version \$imageversion because this build is for ${env.BUILD_TARGET}.\"; \
                     fi"
@@ -332,7 +295,7 @@ git push origin HEAD:master
 String RunInBuilder() {
     "\
     docker exec \
-    -e BUILD_IMAGE_ID=${env.CACHEBUST} \
+    -e CACHEBUST=${env.CACHEBUST} \
     -e 'BUILD_ARGS=--cache-from ${env.BUILD_IMAGE} --cache-from ${env.PMEM_CSI_IMAGE}' \
     -e DOCKER_CONFIG=${WORKSPACE}/_work/docker-config \
     -e REGISTRY_NAME=${env.REGISTRY_NAME} \
@@ -420,15 +383,6 @@ void PrepareEnv() {
             timeout=\$((timeout + 10)); \
        done"
 
-    // Install additional tools:
-    // - ssh client for govm
-    // - python3 for Sphinx (i.e. make html)
-    // - parted, xfsprogs, os-cloudguest-aws (contains mkfs.ext4) for ImageFile test
-    sh "docker exec ${env.BUILD_CONTAINER} swupd bundle-add openssh-client python3-basic parted xfsprogs os-cloudguest-aws"
-
-    // Now commit those changes to ensure that the result of "swupd bundle add" gets cached.
-    sh "docker commit ${env.BUILD_CONTAINER} ${env.BUILD_IMAGE}"
-
     // Make /usr/local/bin writable for all users. Used to install kubectl.
     sh "docker exec ${env.BUILD_CONTAINER} sh -c 'mkdir -p /usr/local/bin && chmod a+wx /usr/local/bin'"
 
@@ -484,19 +438,15 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
         up ourselves. "make stop" was hanging and waiting for these processes to
         exit even though there were from a different "docker exec" invocation.
 
-        The default QEMU cpu enables nested virtualization with "-cpu
-        host".  However, that fails on some Azure machines
-        (`qemu-system-x86_64: error: failed to set MSR 0x48b to
-        0x1582e00000000`,
-        https://www.mail-archive.com/qemu-devel@nongnu.org/msg665051.html),
+        The default QEMU cpu enables nested virtualization with "-cpu host".
+        However, that fails on some Azure machines:
+        `qemu-system-x86_64: error: failed to set MSR 0x48b to 0x1582e00000000`,
+        https://www.mail-archive.com/qemu-devel@nongnu.org/msg665051.html,
         so for now we disable VMX with -vmx.
-
-        TODO: test in parallel (on different nodes? single node didn't work,
-        https://github.com/intel/pmem-CSI/pull/309#issuecomment-504659383)
         */
         sh " \
            loggers=; \
-           atexit () { set -x; kill \$loggers; killall sleep; }; \
+           atexit () { set -x; kill \$loggers ||true; killall sleep ||true; }; \
            trap atexit EXIT; \
            mkdir -p build/reports && \
            if ${env.LOGGING_JOURNALCTL}; then sudo journalctl -f; fi & \
@@ -515,7 +465,7 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
                   ${env.BUILD_CONTAINER} \
                   bash -c 'set -x; \
                            loggers=; \
-                           atexit () { set -x; kill \$loggers; kill \$( ps --no-header -o %p ); }; \
+                           atexit () { set -x; kill \$loggers ||true; }; \
                            trap atexit EXIT; \
                            make stop && \
                            make start && \
@@ -540,12 +490,12 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
                            testrun=\$(echo '${distro}-${distroVersion}-${kubernetesVersion}' | sed -e s/--*/-/g | tr . _ ) && \
                            make test_e2e TEST_E2E_REPORT_DIR=${WORKSPACE}/build/reports.tmp/\$testrun \
                                          TEST_E2E_SKIP=\$(if [ \"${env.CHANGE_ID}\" ] && [ \"${env.CHANGE_ID}\" != null ]; then echo \\\\[Slow\\\\]@${skipIfPR}; fi) \
-                           ' \
+                           ' |tee joblog-${BUILD_TAG}-test-${kubernetesVersion}.log |egrep 'Passed|FAIL:|^ERROR' 2>&1 \
            "
     } catch (exc) {
-        echo "Handling exception, get pod state and kubelet logs:"
-        sh "_work/${env.CLUSTER}/ssh.0 kubectl get pods --all-namespaces -o wide"
-        sh "for cmd in `ls _work/${env.CLUSTER}/ssh.*`; do \$cmd sudo journalctl -u kubelet; done"
+        echo "Handling exception, writing pod state and kubelet logs into joblog-${BUILD_TAG}-kubeletlogs-${kubernetesVersion}.log"
+        sh "_work/${env.CLUSTER}/ssh.0 kubectl get pods --all-namespaces -o wide > joblog-${BUILD_TAG}-kubeletlogs-${kubernetesVersion}.log"
+        sh "for cmd in `ls _work/${env.CLUSTER}/ssh.*`; do \$cmd sudo journalctl -u kubelet > joblog-${BUILD_TAG}-kubeletlogs-${kubernetesVersion}.log; done"
         // regular error handling
         throw exc
     } finally {
@@ -574,6 +524,7 @@ void TestInVM(worker, distro, distroVersion, kubernetesVersion, skipIfPR) {
                     diff $i build/reports/$testrun.xml || true
                fi
            done'''
+        archiveArtifacts('**/joblog-*')
         junit 'build/reports/**/*.xml'
     }
 }

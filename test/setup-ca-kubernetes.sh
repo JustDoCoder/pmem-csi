@@ -10,14 +10,15 @@
 
 # The directory containing setup-ca*.sh.
 : ${TEST_DIRECTORY:=$(dirname $(readlink -f $0))}
-
+. ${TEST_CONFIG:-${TEST_DIRECTORY}/test-config.sh}
 
 tmpdir=`mktemp -d`
 trap 'rm -r $tmpdir' EXIT
 
 # Generate certificates. They are not going to be needed again and will
-# be deleted together with the temp directory.
-WORKDIR="$tmpdir" "$TEST_DIRECTORY/setup-ca.sh"
+# be deleted together with the temp directory. Only the root CA is
+# stored in a permanent location.
+WORKDIR="$tmpdir" CA="$TEST_CA" NS="${TEST_DRIVER_NAMESPACE}" PREFIX="${TEST_DRIVER_PREFIX}" "$TEST_DIRECTORY/setup-ca.sh"
 
 # This reads a file and encodes it for use in a secret.
 read_key () {
@@ -27,34 +28,23 @@ read_key () {
 # Read certificate files and turn them into Kubernetes secrets.
 #
 # -caFile (controller and all nodes)
-CA=$(read_key "$tmpdir/ca.pem")
+CA=$(read_key "${TEST_CA}.pem")
 # -certFile (controller)
-REGISTRY_CERT=$(read_key "$tmpdir/pmem-registry.pem")
+CONTROLLER_CERT=$(read_key "$tmpdir/pmem-controller.pem")
 # -keyFile (controller)
-REGISTRY_KEY=$(read_key "$tmpdir/pmem-registry-key.pem")
-# -certFile (same for all nodes)
-NODE_CERT=$(read_key "$tmpdir/pmem-node-controller.pem")
-# -keyFile (same for all nodes)
-NODE_KEY=$(read_key "$tmpdir/pmem-node-controller-key.pem")
+CONTROLLER_KEY=$(read_key "$tmpdir/pmem-controller-key.pem")
+
+${KUBECTL} get ns ${TEST_DRIVER_NAMESPACE} 2>/dev/null >/dev/null || ${KUBECTL} create ns ${TEST_DRIVER_NAMESPACE}
 
 ${KUBECTL} apply -f - <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
-    name: pmem-csi-registry-secrets
+    name: ${TEST_DRIVER_PREFIX}-controller-secret
+    namespace: ${TEST_DRIVER_NAMESPACE}
 type: kubernetes.io/tls
 data:
     ca.crt: ${CA}
-    tls.crt: ${REGISTRY_CERT}
-    tls.key: ${REGISTRY_KEY}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: pmem-csi-node-secrets
-type: Opaque
-data:
-    ca.crt: ${CA}
-    tls.crt: ${NODE_CERT}
-    tls.key: ${NODE_KEY}
+    tls.crt: ${CONTROLLER_CERT}
+    tls.key: ${CONTROLLER_KEY}
 EOF
